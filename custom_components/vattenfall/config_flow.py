@@ -27,6 +27,7 @@ from .api import (
 from .const import (
     ACCOUNT_TYPE_ELDISTRIBUTION,
     ACCOUNT_TYPE_MIN_ENERGI,
+    ACCOUNT_TYPE_ONLINE_DE,
     CONF_ACCOUNT_TYPE,
     CONF_CUSTOMER_ID,
     CONF_METERING_POINT_ID,
@@ -37,7 +38,10 @@ from .const import (
     DEFAULT_TEMPERATURE_AREA_CODE,
     DOMAIN,
     MIN_ENERGI_UNIQUE_ID_PREFIX,
+    ONLINE_DE_SUBSCRIPTION_KEY,
+    ONLINE_DE_UNIQUE_ID_PREFIX,
 )
+from .de_api import VattenfallDeClient
 from .min_energi_api import VattenfallMinEnergiClient
 
 _PASSWORD_SELECTOR = TextSelector(TextSelectorConfig(type=TextSelectorType.PASSWORD))
@@ -58,6 +62,11 @@ def _is_min_energi(config: Mapping[str, Any]) -> bool:
     return config.get(CONF_ACCOUNT_TYPE) == ACCOUNT_TYPE_MIN_ENERGI
 
 
+def _is_online_de(config: Mapping[str, Any]) -> bool:
+    """Return whether settings belong to a Vattenfall Online Service (DE) entry."""
+    return config.get(CONF_ACCOUNT_TYPE) == ACCOUNT_TYPE_ONLINE_DE
+
+
 class VattenfallConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Vattenfall."""
 
@@ -66,10 +75,13 @@ class VattenfallConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     MINOR_VERSION = 2
 
     def __init__(self) -> None:
-        """Initialize flow state shared between Min energi steps."""
+        """Initialize flow state shared between multi-contract account steps."""
         self._min_energi_input: dict[str, Any] = {}
         self._premises: dict[str, str] = {}
         self._premise_count = 0
+        self._online_de_input: dict[str, Any] = {}
+        self._contracts: dict[str, str] = {}
+        self._contract_count = 0
 
     async def _async_validate(
         self, config: dict[str, Any]
@@ -81,6 +93,19 @@ class VattenfallConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if not errors and premise_id not in {premise["id"] for premise in premises}:
                 # Valid login, but to an account that cannot read this entry's premise.
                 errors = {"base": "premise_not_found"}
+            return config, errors
+
+        if _is_online_de(config):
+            config = {
+                **config,
+                CONF_SUBSCRIPTION_KEY: config.get(CONF_SUBSCRIPTION_KEY)
+                or ONLINE_DE_SUBSCRIPTION_KEY,
+            }
+            contracts, errors = await self._async_validate_online_de(config)
+            contract_id = config.get(CONF_METERING_POINT_ID)
+            if not errors and contract_id and contract_id not in {c["id"] for c in contracts}:
+                # Valid login, but to an account that cannot read this entry's contract.
+                errors = {"base": "contract_not_found"}
             return config, errors
 
         if not config.get(CONF_SUBSCRIPTION_KEY):
@@ -129,11 +154,31 @@ class VattenfallConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             await client.async_close()
         return premises, errors
 
+    async def _async_validate_online_de(
+        self, config: dict[str, Any]
+    ) -> tuple[list[dict[str, Any]], dict[str, str]]:
+        """Log in to the Vattenfall Online Service, returning contracts plus form errors."""
+        contracts: list[dict[str, Any]] = []
+        errors: dict[str, str] = {}
+        client = VattenfallDeClient(hass=self.hass, config=config)
+        try:
+            await client.async_authenticate(force=True)
+            contracts = await client.async_get_contracts()
+        except VattenfallAccessDeniedError:
+            errors["base"] = "invalid_auth"
+        except VattenfallApiError:
+            errors["base"] = "cannot_connect"
+        except Exception:  # pylint: disable=broad-except
+            errors["base"] = "unknown"
+        finally:
+            await client.async_close()
+        return contracts, errors
+
     async def async_step_user(self, user_input: dict[str, Any] | None = None) -> FlowResult:
         """Let the user pick which Vattenfall service to connect."""
         return self.async_show_menu(
             step_id="user",
-            menu_options=[ACCOUNT_TYPE_ELDISTRIBUTION, ACCOUNT_TYPE_MIN_ENERGI],
+            menu_options=[ACCOUNT_TYPE_ELDISTRIBUTION, ACCOUNT_TYPE_MIN_ENERGI, ACCOUNT_TYPE_ONLINE_DE],
         )
 
     async def async_step_eldistribution(
@@ -257,6 +302,94 @@ class VattenfallConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             label += f" – {premise['gridOwner']}"
         return label
 
+    async def async_step_online_de(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Handle login against the Vattenfall Online Service (online.vattenfall.de)."""
+        errors: dict[str, str] = {}
+
+        if user_input is not None:
+            config = {
+                **user_input,
+                CONF_ACCOUNT_TYPE: ACCOUNT_TYPE_ONLINE_DE,
+                CONF_SUBSCRIPTION_KEY: ONLINE_DE_SUBSCRIPTION_KEY,
+            }
+            contracts, errors = await self._async_validate_online_de(config)
+            if not errors:
+                if not contracts:
+                    return self.async_abort(reason="no_contracts")
+                # Compare with Online Service entries only: another account type can
+                # use the same ID for its metering point.
+                configured = {
+                    entry.data.get(CONF_METERING_POINT_ID)
+                    for entry in self._async_current_entries(include_ignore=False)
+                    if _is_online_de(entry.data)
+                }
+                self._contracts = {
+                    contract["id"]: self._contract_label(contract)
+                    for contract in contracts
+                    if contract["id"] not in configured
+                }
+                if not self._contracts:
+                    return self.async_abort(reason="already_configured")
+
+                self._online_de_input = config
+                self._contract_count = len(contracts)
+                return await self.async_step_contract()
+
+        schema = vol.Schema(
+            {
+                vol.Required(CONF_NAME, default=DEFAULT_NAME): str,
+                vol.Required(CONF_CUSTOMER_ID): str,
+                vol.Required(CONF_PASSWORD): _PASSWORD_SELECTOR,
+            }
+        )
+
+        return self.async_show_form(
+            step_id="online_de",
+            data_schema=schema,
+            errors=errors,
+        )
+
+    async def async_step_contract(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """Let the user pick which Online Service contract to add."""
+        if user_input is not None:
+            contract_id = user_input[CONF_METERING_POINT_ID]
+            await self.async_set_unique_id(f"{ONLINE_DE_UNIQUE_ID_PREFIX}{contract_id}")
+            self._abort_if_unique_id_configured()
+
+            name = self._online_de_input.get(CONF_NAME, DEFAULT_NAME)
+            # Count every contract on the account, so the title does not depend on setup order.
+            title = f"{name} ({self._contracts[contract_id]})" if self._contract_count > 1 else name
+            return self.async_create_entry(
+                title=title,
+                data={**self._online_de_input, CONF_METERING_POINT_ID: contract_id},
+            )
+
+        schema = vol.Schema(
+            {
+                vol.Required(
+                    CONF_METERING_POINT_ID, default=next(iter(self._contracts))
+                ): vol.In(self._contracts),
+            }
+        )
+        return self.async_show_form(step_id="contract", data_schema=schema)
+
+    @staticmethod
+    def _contract_label(contract: dict[str, Any]) -> str:
+        """Build a human-readable label for an Online Service contract."""
+        head = " ".join(
+            str(part)
+            for part in (contract.get("sparte"), contract.get("vk_anzeigetext") or contract["id"])
+            if part
+        )
+        label = head or str(contract["id"])
+        if contract.get("address"):
+            label += f" – {contract['address']}"
+        if contract.get("meter_number"):
+            label += f" – Zähler {contract['meter_number']}"
+        return label
+
     async def async_step_reauth(self, entry_data: Mapping[str, Any]) -> FlowResult:
         """Start re-authentication after Vattenfall rejected the saved login."""
         return await self.async_step_reauth_confirm()
@@ -274,8 +407,9 @@ class VattenfallConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     ) -> FlowResult:
         """Change the settings of an existing entry."""
         entry = self._get_reconfigure_entry()
-        if _is_min_energi(entry.data):
-            # Min energi reports temperature per premise, so there is no area to change.
+        if _is_min_energi(entry.data) or _is_online_de(entry.data):
+            # Min energi reports temperature per premise and the Online Service has no
+            # temperature area at all, so there is no area to change.
             return await self._async_update_entry_step("reconfigure", entry, user_input)
 
         area_code = entry.data.get(CONF_TEMPERATURE_AREA_CODE, DEFAULT_TEMPERATURE_AREA_CODE)
@@ -295,10 +429,10 @@ class VattenfallConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     ) -> FlowResult:
         """Show or apply a form that changes an existing entry's settings."""
         errors: dict[str, str] = {}
-        min_energi = _is_min_energi(entry.data)
+        multi_contract = _is_min_energi(entry.data) or _is_online_de(entry.data)
 
         if user_input is not None:
-            if min_energi:
+            if multi_contract:
                 merged = {**entry.data, **user_input}
             else:
                 # A blank key must trigger detection, not fall back to the saved one.
@@ -315,7 +449,7 @@ class VattenfallConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             vol.Required(CONF_CUSTOMER_ID, default=entry.data[CONF_CUSTOMER_ID]): str,
             vol.Required(CONF_PASSWORD): _PASSWORD_SELECTOR,
         }
-        if not min_energi:
+        if not multi_contract:
             fields[vol.Optional(CONF_SUBSCRIPTION_KEY)] = str
         schema = vol.Schema({**fields, **(extra_fields or {})})
 

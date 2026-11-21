@@ -565,10 +565,10 @@ class TestMinEnergiApi(unittest.IsolatedAsyncioTestCase):
 
     def test_create_api_client_selects_by_account_type(self) -> None:
         self.assertIsInstance(
-            min_energi_api.create_api_client(hass=object(), config=_config()),
+            api.create_api_client(hass=object(), config=_config()),
             min_energi_api.VattenfallMinEnergiClient,
         )
-        eldistribution = min_energi_api.create_api_client(
+        eldistribution = api.create_api_client(
             hass=object(),
             config={
                 "metering_point_id": "HDG1",

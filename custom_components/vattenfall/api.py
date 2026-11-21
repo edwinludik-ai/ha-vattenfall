@@ -9,11 +9,15 @@ import logging
 import re
 from typing import Any, Awaitable, Callable, TypeVar
 from urllib.parse import parse_qs, urljoin, urlparse
+import zoneinfo
 
 import httpx
 from homeassistant.core import HomeAssistant
 
 from .const import (
+    ACCOUNT_TYPE_MIN_ENERGI,
+    ACCOUNT_TYPE_ONLINE_DE,
+    CONF_ACCOUNT_TYPE,
     CONF_ALLOW_STUB_DATA,
     CONF_CUSTOMER_ID,
     CONF_METERING_POINT_ID,
@@ -97,6 +101,17 @@ class ContractTariff:
     fixed_fee_incl_vat_incl_discount: float | None
 
 
+@dataclass(slots=True)
+class MeterReading:
+    """A single meter reading (Zählerstand)."""
+
+    meter_number: str
+    reading_date: str
+    value: float
+    unit: str | None = None
+    register: str | None = None
+
+
 async def async_fetch_subscription_key(client: httpx.AsyncClient) -> str:
     """Read the subscription key that Vattenfall's website publishes in its page source."""
     try:
@@ -124,6 +139,12 @@ class VattenfallApiClient:
     supports_quarter_hour = False
     # Whether the client can fetch grid fees from the contract endpoint.
     supports_contract = True
+    # Whether the client can fetch outdoor temperature.
+    supports_temperature = True
+    # Whether the client can fetch meter readings (Zählerstand).
+    supports_meter_readings = False
+    # Timezone the API reports local timestamps in.
+    api_timezone = zoneinfo.ZoneInfo("Europe/Stockholm")
 
     def __init__(self, hass: HomeAssistant, config: dict[str, Any]) -> None:
         self._hass = hass
@@ -992,3 +1013,17 @@ class VattenfallApiClient:
             energy_tax_incl_vat=None,
             fixed_fee_incl_vat_incl_discount=None,
         )
+
+
+def create_api_client(hass: HomeAssistant, config: dict[str, Any]) -> VattenfallApiClient:
+    """Create the API client matching the configured account type."""
+    account_type = config.get(CONF_ACCOUNT_TYPE)
+    if account_type == ACCOUNT_TYPE_MIN_ENERGI:
+        from .min_energi_api import VattenfallMinEnergiClient
+
+        return VattenfallMinEnergiClient(hass=hass, config=config)
+    if account_type == ACCOUNT_TYPE_ONLINE_DE:
+        from .de_api import VattenfallDeClient
+
+        return VattenfallDeClient(hass=hass, config=config)
+    return VattenfallApiClient(hass=hass, config=config)

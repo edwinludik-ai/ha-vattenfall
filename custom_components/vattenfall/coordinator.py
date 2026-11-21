@@ -30,6 +30,7 @@ from .const import (
     ATTR_HOURLY_END_DATE,
     ATTR_HOURLY_POINTS,
     ATTR_HOURLY_START_DATE,
+    ATTR_METER_READING_POINTS,
     ATTR_POINTS,
     ATTR_QUARTER_HOUR_POINTS,
     ATTR_START_DATE,
@@ -70,41 +71,46 @@ def _date_range_chunks(start: date, end: date) -> list[tuple[date, date]]:
     return chunks
 
 
-def _day_start(value: str) -> datetime:
+def _day_start(value: str, tz: zoneinfo.ZoneInfo = _API_TIMEZONE) -> datetime:
     """Return local midnight for an API date or datetime string."""
     day = datetime.fromisoformat(value).date()
-    return datetime(day.year, day.month, day.day, tzinfo=_API_TIMEZONE)
+    return datetime(day.year, day.month, day.day, tzinfo=tz)
 
 
-def _hours_in_day(day: str) -> int:
+def _hours_in_day(day: str, tz: zoneinfo.ZoneInfo = _API_TIMEZONE) -> int:
     """Return the length of a local day in hours, which is 23 or 25 on DST changes."""
-    start = _day_start(day)
-    end = _day_start((start.date() + timedelta(days=1)).isoformat())
+    start = _day_start(day, tz)
+    end = _day_start((start.date() + timedelta(days=1)).isoformat(), tz)
     return round((end.timestamp() - start.timestamp()) / 3600)
 
 
-def _hourly_timestamps(date_times: list[str]) -> list[float]:
+def _hourly_timestamps(
+    date_times: list[str], tz: zoneinfo.ZoneInfo = _API_TIMEZONE
+) -> list[float]:
     """Convert API local times to UTC timestamps, keeping the repeated DST hour apart."""
     timestamps: list[float] = []
     previous: datetime | None = None
     for value in date_times:
         local = datetime.fromisoformat(value)
         fold = 1 if local == previous else 0
-        timestamps.append(local.replace(tzinfo=_API_TIMEZONE, fold=fold).timestamp())
+        timestamps.append(local.replace(tzinfo=tz, fold=fold).timestamp())
         previous = local
     return timestamps
 
 
-def _latest_day(date_times: list[str], before: date) -> str | None:
+def _latest_day(date_times: list[str], before: date, tz: zoneinfo.ZoneInfo = _API_TIMEZONE) -> str | None:
     """Return the newest day before the given date with hourly data, preferring full days."""
     counts = Counter(value[:10] for value in date_times)
     days = [day for day in counts if day < before.isoformat()]
-    full_days = [day for day in days if counts[day] >= _hours_in_day(day)]
+    full_days = [day for day in days if counts[day] >= _hours_in_day(day, tz)]
     return max(full_days or days, default=None)
 
 
 class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Handle fetching data from Vattenfall API."""
+
+    # Timezone the client's API reports local timestamps in (set per client in __init__).
+    _tz: zoneinfo.ZoneInfo = _API_TIMEZONE
 
     def __init__(
         self,
@@ -120,6 +126,7 @@ class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         self.client = client
         self.entry = entry
+        self._tz: zoneinfo.ZoneInfo = getattr(client, "api_timezone", _API_TIMEZONE)
         self._contract_cache: dict[str, Any] | None = None
         self._contract_cache_time: datetime | None = None
 
@@ -249,10 +256,16 @@ class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 builders["quarter_hour"] = lambda: self._async_build_quarter_hour(
                     hourly_start, hourly_end
                 )
-        if temperature_start is not None and temperature_end is not None:
+        if (
+            temperature_start is not None
+            and temperature_end is not None
+            and getattr(self.client, "supports_temperature", True)
+        ):
             builders["temperature"] = lambda: self._async_build_temperature(
                 temperature_start, temperature_end
             )
+        if getattr(self.client, "supports_meter_readings", False):
+            builders["meter_reading"] = self._async_build_meter_reading
 
         previously_failed = (self.data or {}).get(ATTR_FAILED_GROUPS, set())
         data: dict[str, Any] = {}
@@ -289,8 +302,8 @@ class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         return {
             "latest_day_kwh": latest_day_kwh,
-            "latest_day_reset": _day_start(daily_points[-1].date) if daily_points else None,
-            "month_to_date_reset": _day_start(daily_start.isoformat()),
+            "latest_day_reset": _day_start(daily_points[-1].date, self._tz) if daily_points else None,
+            "month_to_date_reset": _day_start(daily_start.isoformat(), self._tz),
             "month_to_date_kwh": month_to_date_kwh,
             "average_daily_kwh": avg_daily_kwh,
             ATTR_START_DATE: daily_start.isoformat(),
@@ -306,7 +319,7 @@ class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         hourly_values = [point.value_kwh for point in hourly_points]
         latest_hour_kwh = hourly_values[-1] if hourly_values else 0.0
 
-        latest_day = _latest_day([p.date_time for p in hourly_points], before=hourly_end)
+        latest_day = _latest_day([p.date_time for p in hourly_points], before=hourly_end, tz=self._tz)
         latest_day_points = [
             p for p in hourly_points if latest_day and p.date_time.startswith(latest_day)
         ]
@@ -326,7 +339,7 @@ class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "latest_hour_kwh": latest_hour_kwh,
             "latest_reading": (
                 datetime.fromtimestamp(
-                    _hourly_timestamps([p.date_time for p in hourly_points])[-1],
+                    _hourly_timestamps([p.date_time for p in hourly_points], self._tz)[-1],
                     timezone.utc,
                 )
                 if hourly_points
@@ -336,7 +349,7 @@ class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "today_peak_hour_kwh": latest_day_peak_hour_kwh,
             "today_peak_hour_time": latest_day_peak_hour_time,
             "hourly_latest_day": latest_day,
-            "hourly_latest_day_reset": _day_start(latest_day) if latest_day else None,
+            "hourly_latest_day_reset": _day_start(latest_day, self._tz) if latest_day else None,
             ATTR_HOURLY_START_DATE: hourly_start.isoformat(),
             ATTR_HOURLY_END_DATE: hourly_end.isoformat(),
             ATTR_HOURLY_POINTS: [asdict(point) for point in hourly_points],
@@ -364,7 +377,7 @@ class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             temperature_start, temperature_end, use_cet=True
         )
         latest_temp_day = _latest_day(
-            [p.date_time for p in temperature_points], before=temperature_end
+            [p.date_time for p in temperature_points], before=temperature_end, tz=self._tz
         )
         selected_day_temp_values = [
             p.value_c
@@ -398,6 +411,19 @@ class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             ATTR_TEMPERATURE_POINTS: [asdict(point) for point in temperature_points],
         }
 
+    async def _async_build_meter_reading(self) -> dict[str, Any]:
+        """Build the meter reading (Zählerstand) part of the coordinator data."""
+        readings = await self.client.async_get_meter_readings()
+        latest = readings[-1] if readings else None
+        return {
+            "latest_meter_reading_value": latest.value if latest else None,
+            "latest_meter_reading_date": latest.reading_date if latest else None,
+            "latest_meter_reading_unit": latest.unit if latest else None,
+            "latest_meter_reading_register": latest.register if latest else None,
+            "meter_number": latest.meter_number if latest else None,
+            ATTR_METER_READING_POINTS: [asdict(reading) for reading in readings],
+        }
+
     async def _async_write_statistics(
         self,
         daily_points: list[ConsumptionPoint],
@@ -418,7 +444,7 @@ class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             statistic_id = f"{DOMAIN}:daily_consumption_{statistic_prefix}"
             stats = await self._async_merged_sum_statistics(
                 statistic_id,
-                {_day_start(point.date).timestamp(): point.value_kwh for point in daily_points},
+                {_day_start(point.date, self._tz).timestamp(): point.value_kwh for point in daily_points},
             )
 
             metadata = StatisticMetaData(
@@ -436,7 +462,7 @@ class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         if hourly_points:
             statistic_id = f"{DOMAIN}:hourly_consumption_{statistic_prefix}"
-            timestamps = _hourly_timestamps([point.date_time for point in hourly_points])
+            timestamps = _hourly_timestamps([point.date_time for point in hourly_points], self._tz)
             stats = await self._async_merged_sum_statistics(
                 statistic_id,
                 {ts: point.value_kwh for ts, point in zip(timestamps, hourly_points)},
@@ -461,7 +487,7 @@ class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )).lower()
             statistic_id = f"{DOMAIN}:temperature_{temperature_area_code}"
 
-            timestamps = _hourly_timestamps([point.date_time for point in temperature_points])
+            timestamps = _hourly_timestamps([point.date_time for point in temperature_points], self._tz)
             stats = [
                 StatisticData(start=datetime.fromtimestamp(ts, timezone.utc), mean=point.value_c)
                 for ts, point in zip(timestamps, temperature_points)

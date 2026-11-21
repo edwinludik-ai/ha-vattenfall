@@ -21,6 +21,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import (
     ACCOUNT_TYPE_MIN_ENERGI,
+    ACCOUNT_TYPE_ONLINE_DE,
     ATTR_END_DATE,
     ATTR_ENERGY_TAX_INCL_VAT,
     ATTR_FAILED_GROUPS,
@@ -28,6 +29,7 @@ from .const import (
     ATTR_HOURLY_END_DATE,
     ATTR_HOURLY_POINTS,
     ATTR_HOURLY_START_DATE,
+    ATTR_METER_READING_POINTS,
     ATTR_POINTS,
     ATTR_QUARTER_HOUR_POINTS,
     ATTR_START_DATE,
@@ -211,6 +213,15 @@ SENSORS: tuple[VattenfallSensorEntityDescription, ...] = (
         icon="mdi:cash-multiple",
         attribute_group="contract",
     ),
+    VattenfallSensorEntityDescription(
+        key="latest_meter_reading",
+        translation_key="latest_meter_reading",
+        name="Latest meter reading",
+        state_class=SensorStateClass.MEASUREMENT,
+        value_key="latest_meter_reading_value",
+        icon="mdi:counter",
+        attribute_group="meter_reading",
+    ),
 )
 
 
@@ -235,6 +246,14 @@ async def async_setup_entry(
             description.attribute_group != "contract"
             or getattr(coordinator.client, "supports_contract", True)
         )
+        and (
+            description.attribute_group != "meter_reading"
+            or getattr(coordinator.client, "supports_meter_readings", False)
+        )
+        and (
+            description.attribute_group != "temperature"
+            or getattr(coordinator.client, "supports_temperature", True)
+        )
     ]
     async_add_entities(entities)
 
@@ -258,10 +277,12 @@ class VattenfallSensor(CoordinatorEntity[VattenfallDataUpdateCoordinator], Senso
         self._attr_unique_id = f"{entry.entry_id}_{description.key}"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, entry.entry_id)},
-            # Min energi accounts can have several premises, so name devices after the entry.
+            # Min energi and Online Service accounts can have several contracts, so name
+            # devices after the entry.
             name=(
                 entry.title
-                if entry.data.get(CONF_ACCOUNT_TYPE) == ACCOUNT_TYPE_MIN_ENERGI
+                if entry.data.get(CONF_ACCOUNT_TYPE)
+                in (ACCOUNT_TYPE_MIN_ENERGI, ACCOUNT_TYPE_ONLINE_DE)
                 else "Vattenfall"
             ),
             manufacturer="Vattenfall",
@@ -333,5 +354,15 @@ class VattenfallSensor(CoordinatorEntity[VattenfallDataUpdateCoordinator], Senso
                 "transfer_fee_incl_vat": data.get(ATTR_TRANSFER_FEE_INCL_VAT),
                 "energy_tax_incl_vat": data.get(ATTR_ENERGY_TAX_INCL_VAT),
                 "fixed_fee_incl_vat_incl_discount": data.get(ATTR_FIXED_FEE_INCL_VAT_INCL_DISCOUNT),
+            }
+        if group == "meter_reading":
+            points = data.get(ATTR_METER_READING_POINTS, [])
+            return {
+                "reading_date": data.get("latest_meter_reading_date"),
+                "unit": data.get("latest_meter_reading_unit"),
+                "register": data.get("latest_meter_reading_register"),
+                "meter_number": data.get("meter_number"),
+                "points_count": len(points),
+                "points": points,
             }
         return {}

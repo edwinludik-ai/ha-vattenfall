@@ -12,7 +12,7 @@ from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
 
-from .api import VattenfallApiClient
+from .api import VattenfallApiClient, create_api_client
 from .const import (
     ACCOUNT_TYPE_MIN_ENERGI,
     CONF_ACCOUNT_TYPE,
@@ -26,7 +26,6 @@ from .const import (
     SERVICE_BACKFILL,
 )
 from .coordinator import VattenfallDataUpdateCoordinator
-from .min_energi_api import create_api_client
 
 PLATFORMS: list[Platform] = [Platform.SENSOR]
 _LOGGER = logging.getLogger(__name__)

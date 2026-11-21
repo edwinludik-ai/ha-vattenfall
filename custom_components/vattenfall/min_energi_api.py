@@ -30,8 +30,6 @@ from .api import (
     VattenfallAuthError,
 )
 from .const import (
-    ACCOUNT_TYPE_MIN_ENERGI,
-    CONF_ACCOUNT_TYPE,
     CONF_METERING_POINT_ID,
     CONF_SUBSCRIPTION_KEY,
     MIN_ENERGI_API_BASE_URL,
@@ -78,13 +76,6 @@ _PREMISES_PARAMS = {
     "combineMicroProductionPremises": "true",
     "combineBatteryPremises": "false",
 }
-
-
-def create_api_client(hass: HomeAssistant, config: Any) -> VattenfallApiClient:
-    """Create the API client matching the configured account type."""
-    if config.get(CONF_ACCOUNT_TYPE) == ACCOUNT_TYPE_MIN_ENERGI:
-        return VattenfallMinEnergiClient(hass=hass, config=config)
-    return VattenfallApiClient(hass=hass, config=config)
 
 
 def _client_side_redirect(

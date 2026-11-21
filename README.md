@@ -3,8 +3,8 @@
 Custom integration for Home Assistant that retrieves electricity consumption from Vattenfall and exposes sensors for
 dashboards, Energy, and automations.
 
-> **Note:** This integration works with Vattenfall in Sweden only, either through Vattenfall Eldistribution (the grid
-> operator, `vattenfalleldistribution.se`) or Vattenfall Min energi (the electricity retailer, `vattenfall.se`). It is
+> **Note:** This integration works with Vattenfall in Sweden (Vattenfall Eldistribution, `vattenfalleldistribution.se`,
+> or Vattenfall Min energi, `vattenfall.se`) and in Germany (Vattenfall Online Service, `online.vattenfall.de`). It is
 > not compatible with Vattenfall in other countries.
 
 ## Features
@@ -20,6 +20,7 @@ dashboards, Energy, and automations.
   - Latest day peak hour
   - Latest consumption reading (timestamp of the newest data from Vattenfall)
   - Latest 15-minute consumption (Min energi only)
+  - Latest meter reading / Zählerstand (Online Service Germany only)
   - Latest outdoor temperature
   - Latest day average temperature
   - Latest day minimum temperature
@@ -131,6 +132,24 @@ series:
 
 Vattenfall publishes the data the day after, so the chart covers yesterday and today, and the sensor only contains
 days Vattenfall reports as complete.
+
+### Vattenfall Online Service (Germany)
+
+Use this for the German customer portal `online.vattenfall.de` (the page behind
+[online.vattenfall.de/zaehlerstand](https://online.vattenfall.de/zaehlerstand) is part of it). Enter the username
+(email address) and password you use to log in there, then pick the contract to add. If the account has several
+contracts, add the integration once per contract.
+
+The integration talks to the portal's own API (`davis.vattenfall.de`), so no subscription key is needed. It reads:
+
+- the consumption time series (`Lastgang`) behind the portal's consumption charts — hourly and daily sensors work
+  like for the Swedish services, and the backfill action works too;
+- the meter readings shown on the Zählerstand page, exposed as a `Latest meter reading` sensor with the full reading
+  history in its `points` attribute.
+
+There are no outdoor temperature or grid fee sensors for Germany, and no 15-minute data. Note that Vattenfall may
+demand a captcha (`FriendlyCaptcha`) for logins from unfamiliar clients; if setup fails with a connection error,
+log in once in a browser at `online.vattenfall.de` and try again.
 
 ## Notes
 
