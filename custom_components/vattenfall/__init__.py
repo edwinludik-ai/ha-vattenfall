@@ -103,6 +103,13 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     return unload_ok
 
 
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Delete the locally stored meter reading history of a removed entry."""
+    from homeassistant.helpers.storage import Store  # noqa: PLC0415
+
+    await Store(hass, 1, f"{DOMAIN}.meter_readings.{entry.entry_id}").async_remove()
+
+
 async def _async_handle_backfill_service(hass: HomeAssistant, call: ServiceCall) -> None:
     """Handle service call to backfill historical data ranges."""
     start_date = call.data[SERVICE_ATTR_START_DATE]

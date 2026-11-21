@@ -20,7 +20,9 @@ dashboards, Energy, and automations.
   - Latest day peak hour
   - Latest consumption reading (timestamp of the newest data from Vattenfall)
   - Latest 15-minute consumption (Min energi only)
-  - Latest meter reading / Zählerstand (Online Service Germany only)
+  - Latest meter reading / Zählerstand, its date, consumption and daily average since the previous reading, daily
+    average and projected consumption over the last 12 months, consumption this year and an estimated current
+    reading (Online Service Germany only)
   - Latest outdoor temperature
   - Latest day average temperature
   - Latest day minimum temperature
@@ -144,8 +146,29 @@ The integration talks to the portal's own API (`davis.vattenfall.de`), so no sub
 
 - the consumption time series (`Lastgang`) behind the portal's consumption charts — hourly and daily sensors work
   like for the Swedish services, and the backfill action works too;
-- the meter readings shown on the Zählerstand page, exposed as a `Latest meter reading` sensor with the full reading
-  history in its `points` attribute.
+- the meter readings shown on the Zählerstand page, exposed as a `Latest meter reading` sensor (the meter's count in
+  kWh) with the full reading history in its `points` attribute.
+
+The reading history is also kept in Home Assistant's storage and merged with every fetch, so readings stay available
+even if the portal stops returning them. From it, the integration derives:
+
+- `Latest meter reading date`, with how the reading was taken (`reading_type`, `reading_reason`, `reading_status`);
+- `Consumption since previous reading` and `Daily average since previous reading`;
+- `Daily average last 12 months` and `Projected yearly consumption` (that average times 365);
+- `Consumption this year`, up to the latest reading, with the period around New Year split by days;
+- `Estimated current meter reading`: the latest reading plus the latest daily average for each day since.
+
+#### Contracts with only meter readings
+
+Vattenfall only has a consumption time series for meters that send it themselves (smart meters). For other meters, the
+portal only knows the readings entered on the Zählerstand page, so the consumption sensors stay unavailable and the log
+says there is no `Lastgang` for the contract.
+
+For the Energy dashboard, the integration turns the readings into the statistic `Vattenfall Meter Reading Consumption`
+(`vattenfall:meter_reading_consumption_<contract>`): the consumption between two readings is spread evenly over the
+hours between their reading dates. Pick it as grid consumption in `Settings` -> `Dashboards` -> `Energy`. Monthly totals
+match your readings; daily and hourly values are averages. It covers all readings on the portal and is extended when a
+new reading appears.
 
 There are no outdoor temperature or grid fee sensors for Germany, and no 15-minute data. Note that Vattenfall may
 demand a captcha (`FriendlyCaptcha`) for logins from unfamiliar clients; if setup fails with a connection error,

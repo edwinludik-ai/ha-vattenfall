@@ -113,6 +113,67 @@ def _lastgang_payload() -> dict:
     }
 
 
+def _portal_meter_payload() -> dict:
+    """Zaehlerstand payload in the shape online.vattenfall.de returns it (newest first)."""
+
+    def stand(day: str, reading: int, consumption: int | None) -> dict:
+        item = {
+            "Ableseart": {"Code": "SELBSTABLESUNG_ONLINE", "Anzeigetext": "Selbstablesung online"},
+            "Ablesedatum": day,
+            "Ablesegrund": {"Code": "ZWISCHENABLESUNG", "Anzeigetext": "Zwischenablesung"},
+            "Status": {"Code": "PLAUSIBEL", "Anzeigetext": "plausibel"},
+            "Zaehlerstand": reading,
+        }
+        if consumption is not None:
+            item["Verbrauch"] = consumption
+        return item
+
+    return {
+        "Zaehler": [
+            {
+                "Zaehlernummer": "987654321",
+                "Zaehlerart": {"Code": "ETZ", "Anzeigetext": "Eintarifzähler"},
+                "Sparte": {"Code": "STROM", "Anzeigetext": "Strom"},
+                "Zaehlwerk": [
+                    {
+                        "Zaehlwerk": {"Code": "001", "Anzeigetext": "001"},
+                        "Obiskennziffer": {"Code": "1-1:1.8.0", "Anzeigetext": "1-1:1.8.0"},
+                        "Zaehlwerksart": {"Code": "HT", "Anzeigetext": "Hochtarif"},
+                        "Zaehlerstand": [
+                            stand("2026-11-01", 10250, 150),
+                            stand("2026-10-01", 10100, 100),
+                            stand("2026-09-01", 10000, None),
+                        ],
+                        "WeitereZaehlerstaendeVorhanden": False,
+                    }
+                ],
+            }
+        ],
+        "Werte": [],
+        "OffenerAbleseauftrag": None,
+        "Jahresverbraeuche": [],
+    }
+
+
+def _lastgang_remark(result: dict) -> FakeResponse:
+    """GetLastgang answer for a range with gaps: status OK plus a REMARK message."""
+    text = "Die Daten für den gewünschten Zeitraum enthalten Lücken."
+    return FakeResponse(
+        status=200,
+        json_body={
+            "StatusCode": "OK",
+            "Meldungen": [
+                {
+                    "Code": "REMARK_GETLASTGANGKOSTEN_LUECKEN_VORHANDEN",
+                    "TechnischeBeschreibung": text,
+                    "FachlicheBeschreibung": text,
+                }
+            ],
+            "Result": result,
+        },
+    )
+
+
 class TestVattenfallDeApi(unittest.IsolatedAsyncioTestCase):
     """Validate the davis API login, envelope and parsing."""
 
@@ -281,6 +342,62 @@ class TestVattenfallDeApi(unittest.IsolatedAsyncioTestCase):
                 await client.async_get_meter_readings()
         self.assertIn("kaputt", str(ctx.exception))
 
+    async def test_meter_readings_use_the_reading_not_the_consumption(self) -> None:
+        routes = _login_routes()
+        routes[("POST", METER_URL)] = [_ok(_portal_meter_payload())]
+        session = FakeHttpxClient(routes)
+        with patch.object(api.httpx, "AsyncClient", return_value=session):
+            client = de_api.VattenfallDeClient(hass=object(), config=_config())
+            readings = await client.async_get_meter_readings()
+
+        self.assertEqual(
+            [(r.reading_date, r.value, r.consumption) for r in readings],
+            [
+                ("2026-09-01", 10000.0, None),
+                ("2026-10-01", 10100.0, 100.0),
+                ("2026-11-01", 10250.0, 150.0),
+            ],
+        )
+        # The portal leaves out the unit; electricity registers count kWh.
+        self.assertEqual({r.unit for r in readings}, {"kWh"})
+        self.assertEqual({r.register for r in readings}, {"HT"})
+        latest = readings[-1]
+        self.assertEqual(latest.reading_type, "Selbstablesung online")
+        self.assertEqual(latest.reading_reason, "Zwischenablesung")
+        self.assertEqual(latest.reading_status, "plausibel")
+        self.assertEqual(latest.meter_type, "Eintarifzähler")
+        self.assertEqual(latest.obis_code, "1-1:1.8.0")
+
+    async def test_lastgang_remark_keeps_the_data_that_was_returned(self) -> None:
+        routes = _login_routes()
+        routes[("POST", LASTGANG_URL)] = [_lastgang_remark(_lastgang_payload())]
+        session = FakeHttpxClient(routes)
+        with patch.object(api.httpx, "AsyncClient", return_value=session):
+            client = de_api.VattenfallDeClient(hass=object(), config=_config())
+            hourly = await client.async_get_hourly_consumption(date(2026, 3, 1), date(2026, 3, 2))
+
+        self.assertEqual([p.value_kwh for p in hourly], [0.5, 0.7, 0.4])
+
+    async def test_lastgang_without_any_data_explains_why(self) -> None:
+        empty = {
+            "DatumVon": "2026-11-01",
+            "DatumBis": "2026-11-20",
+            "ArbeitSumme": None,
+            "ArbeitEinheit": "kWh",
+            "Tage": [],
+        }
+        routes = _login_routes()
+        routes[("POST", LASTGANG_URL)] = [_lastgang_remark(empty)]
+        session = FakeHttpxClient(routes)
+        with patch.object(api.httpx, "AsyncClient", return_value=session):
+            client = de_api.VattenfallDeClient(hass=object(), config=_config())
+            with self.assertRaises(api.VattenfallApiError) as ctx:
+                await client.async_get_daily_consumption(date(2026, 11, 1), date(2026, 11, 20))
+
+        message = str(ctx.exception)
+        self.assertIn("no consumption time series", message)
+        self.assertIn("meter readings", message)
+
     def test_capability_flags(self) -> None:
         client = de_api.VattenfallDeClient(hass=object(), config=_config())
         self.assertFalse(client.supports_temperature)
@@ -332,6 +449,21 @@ class _DeFakeClient:
         ]
 
 
+class _FakeStore:
+    """In-memory stand-in for homeassistant.helpers.storage.Store."""
+
+    def __init__(self, data: dict | None = None) -> None:
+        self.data = data
+        self.saves = 0
+
+    async def async_load(self) -> dict | None:
+        return self.data
+
+    async def async_save(self, data: dict) -> None:
+        self.data = data
+        self.saves += 1
+
+
 class TestDeCoordinatorData(unittest.IsolatedAsyncioTestCase):
     """Validate the coordinator groups for an Online Service client."""
 
@@ -341,6 +473,9 @@ class TestDeCoordinatorData(unittest.IsolatedAsyncioTestCase):
         )
         coordinator.client = _DeFakeClient()
         coordinator.data = None
+        coordinator._tz = ZoneInfo("Europe/Berlin")
+        coordinator._meter_reading_store = _FakeStore()
+        coordinator._stored_meter_readings = None
 
         data = await coordinator._async_build_data(
             daily_start=date(2026, 2, 1),
@@ -360,6 +495,49 @@ class TestDeCoordinatorData(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("latest_temperature_c", data)
         self.assertNotIn(const.ATTR_TEMPERATURE_POINTS, data)
         self.assertEqual(data[const.ATTR_FAILED_GROUPS], set())
+
+
+class TestDeMeterReadingStore(unittest.IsolatedAsyncioTestCase):
+    """Readings are kept in a local store and merged with every fetch."""
+
+    def _coordinator(self, store: _FakeStore):
+        coordinator = coordinator_mod.VattenfallDataUpdateCoordinator.__new__(
+            coordinator_mod.VattenfallDataUpdateCoordinator
+        )
+        coordinator.client = _DeFakeClient()
+        coordinator.data = None
+        coordinator._tz = ZoneInfo("Europe/Berlin")
+        coordinator._meter_reading_store = store
+        coordinator._stored_meter_readings = None
+        return coordinator
+
+    async def test_stored_readings_are_kept_and_saved_only_on_change(self) -> None:
+        older = api.MeterReading(
+            meter_number="987654321",
+            reading_date="2025-12-01T00:00:00",
+            value=11800.0,
+            unit="kWh",
+            register="HT",
+        )
+        store = _FakeStore({"readings": [de_api_asdict(older), {"unknown": "ignored"}]})
+        coordinator = self._coordinator(store)
+
+        first = await coordinator._async_build_meter_reading()
+        second = await coordinator._async_build_meter_reading()
+
+        dates = [p["reading_date"] for p in first[const.ATTR_METER_READING_POINTS]]
+        self.assertEqual(
+            dates, ["2025-12-01T00:00:00", "2026-01-01T00:00:00", "2026-02-01T00:00:00"]
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(store.saves, 1)
+        self.assertEqual(len(store.data["readings"]), 3)
+
+
+def de_api_asdict(reading) -> dict:
+    from dataclasses import asdict
+
+    return asdict(reading)
 
 
 if __name__ == "__main__":

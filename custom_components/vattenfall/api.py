@@ -110,6 +110,14 @@ class MeterReading:
     value: float
     unit: str | None = None
     register: str | None = None
+    # Consumption since the previous reading, as reported by the portal.
+    consumption: float | None = None
+    # Portal display texts, e.g. "Selbstablesung online", "Zwischenablesung", "plausibel".
+    reading_type: str | None = None
+    reading_reason: str | None = None
+    reading_status: str | None = None
+    meter_type: str | None = None
+    obis_code: str | None = None
 
 
 async def async_fetch_subscription_key(client: httpx.AsyncClient) -> str:

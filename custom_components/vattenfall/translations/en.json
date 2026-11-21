@@ -150,6 +150,27 @@
       },
       "latest_meter_reading": {
         "name": "Latest meter reading"
+      },
+      "latest_meter_reading_date": {
+        "name": "Latest meter reading date"
+      },
+      "meter_period_consumption": {
+        "name": "Consumption since previous reading"
+      },
+      "meter_period_daily_average": {
+        "name": "Daily average since previous reading"
+      },
+      "meter_yearly_daily_average": {
+        "name": "Daily average last 12 months"
+      },
+      "meter_projected_yearly_consumption": {
+        "name": "Projected yearly consumption"
+      },
+      "meter_consumption_this_year": {
+        "name": "Consumption this year"
+      },
+      "meter_estimated_reading": {
+        "name": "Estimated current meter reading"
       }
     }
   }

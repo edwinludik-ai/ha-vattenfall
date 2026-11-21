@@ -58,11 +58,16 @@ _AUTH_RETRY_STATUSES = {"ACCESS_DENIED"}
 _AUTH_RETRY_CODES = {"ERROR_TOKEN_INVALID", "ERROR_TOKEN_EXPIRED"}
 _AUTH_DENIED_CODES = {"ERROR_USER_AUTH_FAIL", "ERROR_ACCOUNT_LOCKED", "ERROR_USER_LOCKED"}
 _CAPTCHA_CODES = {"ERROR_CAPTCHA_BENOETIGT", "ERROR_CAPTCHA_FEHLER"}
+_REMARK_PREFIX = "REMARK_"
 
 # Keys seen in Lastgang/Zaehlerstand payloads for the timestamp and the value.
 _DATETIME_KEYS = ("Datum", "Zeitpunkt", "DateTime", "Ablesedatum", "date", "from", "From")
 _VALUE_KEYS = ("Wert", "Verbrauch", "Zaehlerstand", "value", "Value", "consumption", "Consumption")
 _TIME_RE = re.compile(r"[T ]\d{1,2}:\d{2}")
+# Zaehlerstand items carry both the reading and the consumption since the previous one
+# ("Verbrauch"), so readings use their own keys rather than _VALUE_KEYS.
+_READING_DATE_KEYS = ("Ablesedatum", *_DATETIME_KEYS)
+_READING_VALUE_KEYS = ("Zaehlerstand", "Ablesewert", "Wert", "Value", "value")
 
 
 class VattenfallDeClient(VattenfallApiClient):
@@ -195,7 +200,10 @@ class VattenfallDeClient(VattenfallApiClient):
         status = payload.get("StatusCode")
         meldungen = payload.get("Meldungen") or []
         codes = {m.get("Code") for m in meldungen if isinstance(m, dict)}
-        if status == "OK" and not meldungen:
+        if status == "OK" and all(str(code).startswith(_REMARK_PREFIX) for code in codes):
+            # REMARK_* messages are notes on a successful answer, such as gaps in a range.
+            if meldungen:
+                _LOGGER.debug("davis API notes for %s: %s", path, _first_message(meldungen))
             return payload
 
         if codes & _AUTH_DENIED_CODES or status == "LOGIN_ERROR":
@@ -286,15 +294,20 @@ class VattenfallDeClient(VattenfallApiClient):
             if not isinstance(zaehler, dict):
                 continue
             meter_number = str(zaehler.get("Zaehlernummer") or "")
+            # The portal leaves out the unit; electricity registers count kWh.
+            default_unit = "kWh" if (zaehler.get("Sparte") or {}).get("Code") == "STROM" else None
+            meter_type = _display_text(zaehler.get("Zaehlerart"))
             for werk in zaehler.get("Zaehlwerk") or []:
                 if not isinstance(werk, dict):
                     continue
                 register = (werk.get("Zaehlwerksart") or {}).get("Code")
+                obis_code = _display_text(werk.get("Obiskennziffer"))
                 for stand in werk.get("Zaehlerstand") or []:
                     if not isinstance(stand, dict):
                         continue
-                    reading_date = _first_present(stand, *_DATETIME_KEYS)
-                    value = _first_present(stand, *_VALUE_KEYS)
+                    reading_date = _first_present(stand, *_READING_DATE_KEYS)
+                    value = _first_present(stand, *_READING_VALUE_KEYS)
+                    consumption = stand.get("Verbrauch")
                     try:
                         if reading_date is not None and value is not None:
                             readings.append(
@@ -302,8 +315,14 @@ class VattenfallDeClient(VattenfallApiClient):
                                     meter_number=meter_number,
                                     reading_date=str(reading_date),
                                     value=float(value),
-                                    unit=stand.get("Einheit"),
+                                    unit=stand.get("Einheit") or default_unit,
                                     register=str(register) if register else None,
+                                    consumption=float(consumption) if consumption is not None else None,
+                                    reading_type=_display_text(stand.get("Ableseart")),
+                                    reading_reason=_display_text(stand.get("Ablesegrund")),
+                                    reading_status=_display_text(stand.get("Status")),
+                                    meter_type=meter_type,
+                                    obis_code=obis_code,
                                 )
                             )
                     except (TypeError, ValueError):
@@ -348,6 +367,12 @@ class VattenfallDeClient(VattenfallApiClient):
             else:
                 daily.append(ConsumptionPoint(date=stamp[:10], value_kwh=numeric))
 
+        if not daily and not hourly:
+            raise VattenfallApiError(
+                f"Vattenfall has no consumption time series (Lastgang) for this contract "
+                f"from {start_date.isoformat()} to {end_date.isoformat()}; contracts without "
+                "a smart meter only have meter readings"
+            )
         hourly.sort(key=lambda p: p.date_time)
         daily.sort(key=lambda p: p.date)
         if not daily and hourly:
@@ -382,6 +407,14 @@ class VattenfallDeClient(VattenfallApiClient):
 def _first_present(item: dict[str, Any], *keys: str) -> Any:
     """Return the first non-None value for keys, keeping falsy values such as 0."""
     return next((item[key] for key in keys if item.get(key) is not None), None)
+
+
+def _display_text(value: Any) -> str | None:
+    """Return the display text of a {"Code", "Anzeigetext"} pair, falling back to the code."""
+    if isinstance(value, dict):
+        text = value.get("Anzeigetext") or value.get("Code")
+        return str(text) if text else None
+    return str(value) if value else None
 
 
 def _first_message(meldungen: list[Any]) -> str:

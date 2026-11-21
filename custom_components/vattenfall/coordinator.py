@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from datetime import date, datetime, timedelta, timezone
 import logging
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
@@ -18,6 +18,7 @@ from .api import (
     ConsumptionPoint,
     HourlyConsumptionPoint,
     HourlyTemperaturePoint,
+    MeterReading,
     VattenfallAccessDeniedError,
     VattenfallApiClient,
     VattenfallApiError,
@@ -56,6 +57,8 @@ _CHUNK_MONTHS = 3
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 # Tariffs change roughly once a year, so refreshing them daily is plenty.
 _CONTRACT_CACHE_TTL = timedelta(hours=24)
+_METER_READING_STORE_VERSION = 1
+_METER_READING_FIELDS = frozenset(field.name for field in fields(MeterReading))
 
 
 def _date_range_chunks(start: date, end: date) -> list[tuple[date, date]]:
@@ -106,6 +109,139 @@ def _latest_day(date_times: list[str], before: date, tz: zoneinfo.ZoneInfo = _AP
     return max(full_days or days, default=None)
 
 
+def _spread_meter_readings(
+    readings: list[MeterReading], tz: zoneinfo.ZoneInfo = _API_TIMEZONE
+) -> dict[float, float]:
+    """Spread the consumption between consecutive meter readings evenly over its hours.
+
+    Returns kWh per hour keyed by the UTC timestamp of the hour's start. Each meter and
+    register is its own series, so a meter change does not count as consumption and the
+    registers of a two-tariff meter add up. A falling reading is skipped.
+    """
+    series: dict[tuple[str, str | None], list[MeterReading]] = {}
+    for reading in readings:
+        series.setdefault((reading.meter_number, reading.register), []).append(reading)
+
+    hourly: dict[float, float] = {}
+    for points in series.values():
+        points.sort(key=lambda reading: reading.reading_date)
+        for previous, current in zip(points, points[1:]):
+            start = _day_start(previous.reading_date, tz).timestamp()
+            end = _day_start(current.reading_date, tz).timestamp()
+            hours = round((end - start) / 3600)
+            delta = current.value - previous.value
+            if hours <= 0 or delta < 0:
+                continue
+            per_hour = delta / hours
+            for hour in range(hours):
+                stamp = start + hour * 3600
+                hourly[stamp] = hourly.get(stamp, 0.0) + per_hour
+    return hourly
+
+
+def _reading_day(reading: MeterReading) -> date:
+    """Return the local day of a meter reading."""
+    return datetime.fromisoformat(reading.reading_date).date()
+
+
+def _merge_meter_readings(
+    stored: list[MeterReading], fetched: list[MeterReading]
+) -> list[MeterReading]:
+    """Merge fetched readings into the stored ones, one per meter, register and day.
+
+    A fetched reading replaces a stored one for the same day, so portal corrections win,
+    and stored readings the portal no longer returns are kept.
+    """
+    merged: dict[tuple[str, str | None, date], MeterReading] = {}
+    for reading in [*stored, *fetched]:
+        merged[(reading.meter_number, reading.register, _reading_day(reading))] = reading
+    return sorted(merged.values(), key=_reading_day)
+
+
+def _meter_reading_summary(
+    readings: list[MeterReading], today: date, tz: zoneinfo.ZoneInfo = _API_TIMEZONE
+) -> dict[str, Any]:
+    """Derive the meter reading sensor values from the reading history.
+
+    Periods use the series (meter and register) of the newest reading.
+    """
+    summary: dict[str, Any] = {
+        "latest_meter_reading_time": None,
+        "meter_period_kwh": None,
+        "meter_period_daily_kwh": None,
+        "meter_period_attributes": {},
+        "meter_yearly_daily_kwh": None,
+        "meter_projected_yearly_kwh": None,
+        "meter_yearly_attributes": {},
+        "meter_this_year_kwh": None,
+        "meter_this_year_attributes": {},
+        "meter_estimated_reading": None,
+        "meter_estimated_attributes": {},
+    }
+    if not readings:
+        return summary
+
+    latest = max(readings, key=_reading_day)
+    latest_day = _reading_day(latest)
+    series = sorted(
+        (
+            r
+            for r in readings
+            if (r.meter_number, r.register) == (latest.meter_number, latest.register)
+        ),
+        key=_reading_day,
+    )
+    summary["latest_meter_reading_time"] = _day_start(latest.reading_date, tz)
+
+    if len(series) > 1:
+        previous = series[-2]
+        days = (latest_day - _reading_day(previous)).days
+        if days > 0:
+            period_kwh = round(latest.value - previous.value, 3)
+            summary["meter_period_kwh"] = period_kwh
+            summary["meter_period_daily_kwh"] = round(period_kwh / days, 3)
+            summary["meter_period_attributes"] = {
+                "period_start": _reading_day(previous).isoformat(),
+                "period_end": latest_day.isoformat(),
+                "days": days,
+            }
+
+        # Last 12 months: from the oldest reading at most a year before the newest one.
+        year_ago = latest_day - timedelta(days=365)
+        baseline = next(r for r in series if _reading_day(r) >= year_ago)
+        days = (latest_day - _reading_day(baseline)).days
+        if days > 0:
+            daily_kwh = (latest.value - baseline.value) / days
+            summary["meter_yearly_daily_kwh"] = round(daily_kwh, 3)
+            summary["meter_projected_yearly_kwh"] = round(daily_kwh * 365)
+            summary["meter_yearly_attributes"] = {
+                "since": _reading_day(baseline).isoformat(),
+                "until": latest_day.isoformat(),
+                "days": days,
+            }
+
+    hourly = _spread_meter_readings(readings, tz)
+    if hourly:
+        year_start = datetime(latest_day.year, 1, 1, tzinfo=tz).timestamp()
+        summary["meter_this_year_kwh"] = round(
+            sum(kwh for start, kwh in hourly.items() if start >= year_start), 1
+        )
+        summary["meter_this_year_attributes"] = {
+            "year": latest_day.year,
+            "until": latest_day.isoformat(),
+        }
+
+    daily_kwh = summary["meter_period_daily_kwh"]
+    days_since = (today - latest_day).days
+    if daily_kwh is not None and days_since >= 0:
+        summary["meter_estimated_reading"] = round(latest.value + daily_kwh * days_since, 1)
+        summary["meter_estimated_attributes"] = {
+            "days_since_reading": days_since,
+            "daily_kwh": daily_kwh,
+        }
+    return summary
+
+
 class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Handle fetching data from Vattenfall API."""
 
@@ -129,6 +265,11 @@ class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._tz: zoneinfo.ZoneInfo = getattr(client, "api_timezone", _API_TIMEZONE)
         self._contract_cache: dict[str, Any] | None = None
         self._contract_cache_time: datetime | None = None
+        # Meter readings the statistics were last written for, to write only on change.
+        self._meter_statistics_readings: list[MeterReading] | None = None
+        # Local copy of the reading history, merged with every fetch (created on first use).
+        self._meter_reading_store: Any = None
+        self._stored_meter_readings: list[MeterReading] | None = None
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch latest data from API."""
@@ -150,6 +291,13 @@ class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             raise ConfigEntryAuthFailed(f"Vattenfall rejected the login: {err}") from err
         except VattenfallApiError as err:
             raise UpdateFailed(f"Failed to fetch data from Vattenfall API: {err}") from err
+
+        if data.get(ATTR_METER_READING_POINTS):
+            readings = [MeterReading(**point) for point in data[ATTR_METER_READING_POINTS]]
+            try:
+                await self._async_write_meter_reading_statistics(readings)
+            except Exception:  # noqa: BLE001 - statistics are extra; keep the sensors updating
+                _LOGGER.exception("Could not write Vattenfall meter reading statistics")
 
         # Fee details are optional, so a failure here must not fail the whole update.
         try:
@@ -413,16 +561,60 @@ class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _async_build_meter_reading(self) -> dict[str, Any]:
         """Build the meter reading (Zählerstand) part of the coordinator data."""
-        readings = await self.client.async_get_meter_readings()
-        latest = readings[-1] if readings else None
+        fetched = await self.client.async_get_meter_readings()
+        readings = await self._async_merge_stored_meter_readings(fetched)
+        latest = max(readings, key=_reading_day) if readings else None
         return {
             "latest_meter_reading_value": latest.value if latest else None,
             "latest_meter_reading_date": latest.reading_date if latest else None,
             "latest_meter_reading_unit": latest.unit if latest else None,
             "latest_meter_reading_register": latest.register if latest else None,
             "meter_number": latest.meter_number if latest else None,
+            "latest_meter_reading_details": {
+                "reading_type": latest.reading_type,
+                "reading_reason": latest.reading_reason,
+                "reading_status": latest.reading_status,
+                "meter_type": latest.meter_type,
+                "obis_code": latest.obis_code,
+            }
+            if latest
+            else {},
+            **_meter_reading_summary(readings, date.today(), self._tz),
             ATTR_METER_READING_POINTS: [asdict(reading) for reading in readings],
         }
+
+    async def _async_merge_stored_meter_readings(
+        self, fetched: list[MeterReading]
+    ) -> list[MeterReading]:
+        """Merge fetched readings into the local store and return the full history."""
+        if self._meter_reading_store is None:
+            from homeassistant.helpers.storage import Store  # noqa: PLC0415
+
+            self._meter_reading_store = Store(
+                self.hass,
+                _METER_READING_STORE_VERSION,
+                f"{DOMAIN}.meter_readings.{self.entry.entry_id}",
+            )
+        if self._stored_meter_readings is None:
+            stored = await self._meter_reading_store.async_load() or {}
+            self._stored_meter_readings = []
+            for item in stored.get("readings") or []:
+                try:
+                    self._stored_meter_readings.append(
+                        MeterReading(
+                            **{k: v for k, v in item.items() if k in _METER_READING_FIELDS}
+                        )
+                    )
+                except TypeError:
+                    continue
+
+        merged = _merge_meter_readings(self._stored_meter_readings, fetched)
+        if merged != self._stored_meter_readings:
+            await self._meter_reading_store.async_save(
+                {"readings": [asdict(reading) for reading in merged]}
+            )
+            self._stored_meter_readings = merged
+        return merged
 
     async def _async_write_statistics(
         self,
@@ -505,6 +697,48 @@ class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
             async_add_external_statistics(self.hass, metadata, stats)
             _LOGGER.debug("Wrote %d temperature statistics for %s", len(stats), statistic_id)
+
+    async def _async_write_meter_reading_statistics(self, readings: list[MeterReading]) -> None:
+        """Write hourly consumption spread between meter readings as an external statistic.
+
+        For contracts with only meter readings (no Lastgang), this is what the Energy
+        dashboard can use. The series is rebuilt from all readings whenever they change.
+        """
+        if readings == self._meter_statistics_readings:
+            return
+        hourly = _spread_meter_readings(readings, self._tz)
+        if hourly:
+            from homeassistant.components.recorder.models import StatisticData, StatisticMeanType, StatisticMetaData  # noqa: PLC0415
+            from homeassistant.components.recorder.statistics import async_add_external_statistics  # noqa: PLC0415
+            from homeassistant.const import UnitOfEnergy  # noqa: PLC0415
+            from homeassistant.util.unit_conversion import EnergyConverter  # noqa: PLC0415
+
+            metering_point_id: str = self.entry.data[CONF_METERING_POINT_ID]
+            statistic_id = f"{DOMAIN}:meter_reading_consumption_{metering_point_id.lower()}"
+            total = 0.0
+            stats: list[StatisticData] = []
+            for start in sorted(hourly):
+                total += hourly[start]
+                stats.append(
+                    StatisticData(
+                        start=datetime.fromtimestamp(start, timezone.utc),
+                        state=round(hourly[start], 4),
+                        sum=round(total, 4),
+                    )
+                )
+            metadata = StatisticMetaData(
+                has_mean=False,
+                has_sum=True,
+                mean_type=StatisticMeanType.NONE,
+                name=f"Vattenfall Meter Reading Consumption {metering_point_id}",
+                source=DOMAIN,
+                statistic_id=statistic_id,
+                unit_class=EnergyConverter.UNIT_CLASS,
+                unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+            )
+            async_add_external_statistics(self.hass, metadata, stats)
+            _LOGGER.debug("Wrote %d meter reading statistics for %s", len(stats), statistic_id)
+        self._meter_statistics_readings = list(readings)
 
     async def _async_merged_sum_statistics(
         self, statistic_id: str, new_values: dict[float, float]
