@@ -33,12 +33,12 @@ from .const import (
     ACCOUNT_TYPE_ONLINE_DE,
     CONF_ACCOUNT_TYPE,
     CONF_CUSTOMER_ID,
+    CONF_DOWNLOAD_DAY,
     CONF_ENERGY_PRICE,
     CONF_METERING_POINT_ID,
     CONF_PASSWORD,
     CONF_SUBSCRIPTION_KEY,
     CONF_TEMPERATURE_AREA_CODE,
-    CONF_UPDATE_INTERVAL_DAYS,
     DEFAULT_NAME,
     DEFAULT_TEMPERATURE_AREA_CODE,
     DOMAIN,
@@ -474,22 +474,22 @@ class VattenfallConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 
 class VattenfallOptionsFlow(config_entries.OptionsFlow):
-    """Set the electricity price and the download interval of Online Service entries."""
+    """Set the electricity price and the download day of Online Service entries."""
 
     def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
         """Keep the entry; self.config_entry is set by Home Assistant only from 2024.11."""
         self._entry = config_entry
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> FlowResult:
-        """Ask for the price per kWh (empty removes it) and the days between downloads."""
+        """Ask for the price per kWh (empty removes it) and the day of the month to download."""
         if user_input is not None:
             options = dict(user_input)
-            if options.get(CONF_UPDATE_INTERVAL_DAYS) is not None:
-                options[CONF_UPDATE_INTERVAL_DAYS] = int(options[CONF_UPDATE_INTERVAL_DAYS])
+            if options.get(CONF_DOWNLOAD_DAY) is not None:
+                options[CONF_DOWNLOAD_DAY] = int(options[CONF_DOWNLOAD_DAY])
             return self.async_create_entry(title="", data=options)
 
-        interval = self._entry.options.get(
-            CONF_UPDATE_INTERVAL_DAYS, VattenfallDeClient.default_download_interval.days
+        download_day = self._entry.options.get(
+            CONF_DOWNLOAD_DAY, VattenfallDeClient.default_download_day
         )
         currency = self.hass.config.currency
         schema = vol.Schema(
@@ -507,16 +507,10 @@ class VattenfallOptionsFlow(config_entries.OptionsFlow):
                     )
                 ),
                 vol.Optional(
-                    CONF_UPDATE_INTERVAL_DAYS,
-                    description={"suggested_value": interval},
+                    CONF_DOWNLOAD_DAY,
+                    description={"suggested_value": download_day},
                 ): NumberSelector(
-                    NumberSelectorConfig(
-                        min=1,
-                        max=365,
-                        step=1,
-                        mode=NumberSelectorMode.BOX,
-                        unit_of_measurement="d",
-                    )
+                    NumberSelectorConfig(min=1, max=31, step=1, mode=NumberSelectorMode.BOX)
                 ),
             }
         )

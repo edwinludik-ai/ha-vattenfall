@@ -15,8 +15,8 @@ CONF_TEMPERATURE_AREA_CODE = "temperature_area_code"
 CONF_ACCOUNT_TYPE = "account_type"
 # Option: electricity price per kWh, for the meter reading cost statistic.
 CONF_ENERGY_PRICE = "energy_price"
-# Option: days between downloads for clients that download on a schedule (Online Service).
-CONF_UPDATE_INTERVAL_DAYS = "update_interval_days"
+# Option: day of the month to download on, for clients that download on a schedule.
+CONF_DOWNLOAD_DAY = "download_day"
 
 ACCOUNT_TYPE_ELDISTRIBUTION = "eldistribution"
 ACCOUNT_TYPE_MIN_ENERGI = "min_energi"

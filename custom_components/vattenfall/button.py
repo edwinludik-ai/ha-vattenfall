@@ -22,7 +22,7 @@ async def async_setup_entry(
     coordinator: VattenfallDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id][
         "coordinator"
     ]
-    if coordinator.download_interval is not None:
+    if coordinator.download_day is not None:
         async_add_entities([VattenfallDownloadButton(coordinator, entry)])
 
 

@@ -10,7 +10,7 @@ dashboards, Energy, and automations.
 ## Features
 
 - Config flow setup from Home Assistant UI, with re-authentication and reconfigure support
-- Hourly data updates via coordinator (Online Service Germany: a download every 30 days by default, adjustable, plus a
+- Hourly data updates via coordinator (Online Service Germany: a monthly download on a day you choose, plus a
   `Download data now` button)
 - Consumption sensors:
   - Latest day consumption
@@ -173,9 +173,11 @@ new reading appears.
 
 #### Download schedule
 
-The German portal only changes when a reading is entered, so Online Service entries download from Vattenfall once every
-30 days instead of every hour. Change the `Download interval` (in days) in the entry's `Configure` dialog. The time of
-the last download is stored, so restarting Home Assistant does not download again before the interval has passed; in
+The German portal only changes when a reading is entered, so Online Service entries download from Vattenfall once a
+month instead of every hour: on the download day (default the 2nd, the day after readings are usually entered), at the
+first hourly check after midnight (Europe/Berlin). Change the `Download day of the month` (1–31) in the entry's
+`Configure` dialog; months with fewer days use their last day. Setting up the entry downloads right away. The time of
+the last download is stored, so restarting Home Assistant does not download again before the next download day; in
 between, the sensors use the stored readings (and values that depend on today's date, such as the estimated current
 reading, keep moving). Consumption time series sensors, which smart meters have, are not stored and stay unavailable
 after a restart until the next download.

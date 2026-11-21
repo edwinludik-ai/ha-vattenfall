@@ -355,7 +355,7 @@ async def async_setup_entry(
         )
         and (
             description.attribute_group != "schedule"
-            or coordinator.download_interval is not None
+            or coordinator.download_day is not None
         )
     ]
     async_add_entities(entities)
@@ -450,8 +450,7 @@ class VattenfallSensor(CoordinatorEntity[VattenfallDataUpdateCoordinator], Senso
                 "fixed_fee_incl_vat_incl_discount": data.get(ATTR_FIXED_FEE_INCL_VAT_INCL_DISCOUNT),
             }
         if group == "schedule":
-            interval = self.coordinator.download_interval
-            return {"interval_days": interval.days if interval else None}
+            return {"download_day": self.coordinator.download_day}
         if group == "meter_reading":
             points = data.get(ATTR_METER_READING_POINTS, [])
             return {

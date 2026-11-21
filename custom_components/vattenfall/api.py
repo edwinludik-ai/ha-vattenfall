@@ -153,8 +153,9 @@ class VattenfallApiClient:
     supports_meter_readings = False
     # Timezone the API reports local timestamps in.
     api_timezone = zoneinfo.ZoneInfo("Europe/Stockholm")
-    # Download only once per interval (stored data is used in between); None means every update.
-    default_download_interval: timedelta | None = None
+    # Download only on this day of the month (stored data is used in between); None means
+    # every update downloads.
+    default_download_day: int | None = None
 
     def __init__(self, hass: HomeAssistant, config: dict[str, Any]) -> None:
         self._hass = hass

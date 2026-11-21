@@ -539,7 +539,7 @@ class TestDeMeterReadingStore(unittest.IsolatedAsyncioTestCase):
 class _ScheduledDeClient(_DeFakeClient):
     """Online Service client without a Lastgang, counting meter reading downloads."""
 
-    default_download_interval = de_api.VattenfallDeClient.default_download_interval
+    default_download_day = de_api.VattenfallDeClient.default_download_day
 
     def __init__(self) -> None:
         self.downloads = 0
@@ -561,10 +561,53 @@ class _ScheduledDeClient(_DeFakeClient):
         return await super().async_get_meter_readings(allow_stub)
 
 
-class TestDeScheduledDownloads(unittest.IsolatedAsyncioTestCase):
-    """Online Service data is downloaded once per interval and on request."""
+_BERLIN = ZoneInfo("Europe/Berlin")
+# Saturday 21 November 2026, noon in Berlin.
+_NOW = datetime(2026, 11, 21, 12, tzinfo=_BERLIN).astimezone(timezone.utc)
 
-    def _coordinator(self, store: _FakeStore, options: dict | None = None):
+
+class TestDownloadDaySchedule(unittest.TestCase):
+    """The scheduled download time is local midnight on the download day."""
+
+    def test_latest_and_next_download_time(self) -> None:
+        self.assertEqual(
+            coordinator_mod._scheduled_download_before(_NOW, 2, _BERLIN),
+            datetime(2026, 11, 2, tzinfo=_BERLIN),
+        )
+        self.assertEqual(
+            coordinator_mod._scheduled_download_after(_NOW, 2, _BERLIN),
+            datetime(2026, 12, 2, tzinfo=_BERLIN),
+        )
+
+    def test_short_months_use_their_last_day(self) -> None:
+        now = datetime(2026, 2, 15, tzinfo=_BERLIN)
+        self.assertEqual(
+            coordinator_mod._scheduled_download_before(now, 31, _BERLIN),
+            datetime(2026, 1, 31, tzinfo=_BERLIN),
+        )
+        self.assertEqual(
+            coordinator_mod._scheduled_download_after(now, 31, _BERLIN),
+            datetime(2026, 2, 28, tzinfo=_BERLIN),
+        )
+
+    def test_year_boundaries_and_exact_time(self) -> None:
+        now = datetime(2026, 1, 3, tzinfo=_BERLIN)
+        self.assertEqual(
+            coordinator_mod._scheduled_download_before(now, 5, _BERLIN),
+            datetime(2025, 12, 5, tzinfo=_BERLIN),
+        )
+        exact = datetime(2026, 12, 2, tzinfo=_BERLIN)
+        self.assertEqual(coordinator_mod._scheduled_download_before(exact, 2, _BERLIN), exact)
+        self.assertEqual(
+            coordinator_mod._scheduled_download_after(exact, 2, _BERLIN),
+            datetime(2027, 1, 2, tzinfo=_BERLIN),
+        )
+
+
+class TestDeScheduledDownloads(unittest.IsolatedAsyncioTestCase):
+    """Online Service data is downloaded on a day of the month and on request."""
+
+    def _coordinator(self, store: _FakeStore, options: dict | None = None, now: datetime = _NOW):
         client = _ScheduledDeClient()
         entry = SimpleNamespace(
             entry_id="entry-1", data={"metering_point_id": VK}, options=options or {}
@@ -574,11 +617,15 @@ class TestDeScheduledDownloads(unittest.IsolatedAsyncioTestCase):
         )
         coordinator._meter_reading_store = store
         coordinator._async_write_meter_reading_statistics = AsyncMock()
+        coordinator._now = lambda: now
         return coordinator, client
 
-    def test_online_service_defaults_to_a_monthly_download(self) -> None:
-        self.assertEqual(de_api.VattenfallDeClient.default_download_interval, timedelta(days=30))
-        self.assertIsNone(api.VattenfallApiClient.default_download_interval)
+    async def _stored_readings(self) -> list[dict]:
+        return [de_api_asdict(r) for r in await _DeFakeClient().async_get_meter_readings()]
+
+    def test_online_service_defaults_to_the_second_of_the_month(self) -> None:
+        self.assertEqual(de_api.VattenfallDeClient.default_download_day, 2)
+        self.assertIsNone(api.VattenfallApiClient.default_download_day)
 
     async def test_first_update_downloads_and_later_updates_reuse_the_data(self) -> None:
         store = _FakeStore()
@@ -590,16 +637,14 @@ class TestDeScheduledDownloads(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(client.downloads, 1)
         self.assertEqual(second["latest_meter_reading_value"], 12345.6)
-        self.assertIsNotNone(store.data["last_download"])
-        last = datetime.fromisoformat(store.data["last_download"])
-        self.assertEqual(second[const.ATTR_LAST_DOWNLOAD], last)
-        self.assertEqual(second[const.ATTR_NEXT_DOWNLOAD], last + timedelta(days=30))
+        self.assertEqual(store.data["last_download"], _NOW.isoformat())
+        self.assertEqual(second[const.ATTR_LAST_DOWNLOAD], _NOW)
+        self.assertEqual(second[const.ATTR_NEXT_DOWNLOAD], datetime(2026, 12, 2, tzinfo=_BERLIN))
 
-    async def test_restart_within_the_interval_uses_stored_readings(self) -> None:
-        recent = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
-        stored = [de_api_asdict(r) for r in await _DeFakeClient().async_get_meter_readings()]
+    async def test_restart_after_this_months_download_uses_stored_readings(self) -> None:
+        downloaded = datetime(2026, 11, 2, 0, 30, tzinfo=_BERLIN).isoformat()
         coordinator, client = self._coordinator(
-            _FakeStore({"readings": stored, "last_download": recent})
+            _FakeStore({"readings": await self._stored_readings(), "last_download": downloaded})
         )
 
         data = await coordinator._async_update_data()
@@ -609,23 +654,34 @@ class TestDeScheduledDownloads(unittest.IsolatedAsyncioTestCase):
         # Groups that are not stored stay unavailable until the next download.
         self.assertEqual(data[const.ATTR_FAILED_GROUPS], {"daily", "hourly"})
 
-    async def test_download_is_due_after_the_configured_interval(self) -> None:
-        old = (datetime.now(timezone.utc) - timedelta(days=8)).isoformat()
+    async def test_download_is_due_once_the_download_day_has_passed(self) -> None:
+        downloaded = datetime(2026, 11, 2, 0, 30, tzinfo=_BERLIN).isoformat()
         coordinator, client = self._coordinator(
-            _FakeStore({"readings": [], "last_download": old}),
-            options={const.CONF_UPDATE_INTERVAL_DAYS: 7},
+            _FakeStore({"readings": [], "last_download": downloaded}),
+            options={const.CONF_DOWNLOAD_DAY: 20},
         )
 
         data = await coordinator._async_update_data()
 
         self.assertEqual(client.downloads, 1)
-        self.assertEqual(
-            data[const.ATTR_NEXT_DOWNLOAD] - data[const.ATTR_LAST_DOWNLOAD], timedelta(days=7)
+        self.assertEqual(data[const.ATTR_NEXT_DOWNLOAD], datetime(2026, 12, 20, tzinfo=_BERLIN))
+
+    async def test_download_waits_for_the_download_day(self) -> None:
+        downloaded = datetime(2026, 11, 2, 0, 30, tzinfo=_BERLIN).isoformat()
+        coordinator, client = self._coordinator(
+            _FakeStore({"readings": [], "last_download": downloaded}),
+            options={const.CONF_DOWNLOAD_DAY: 25},
         )
 
-    async def test_manual_download_ignores_the_interval(self) -> None:
-        recent = datetime.now(timezone.utc).isoformat()
-        coordinator, client = self._coordinator(_FakeStore({"readings": [], "last_download": recent}))
+        data = await coordinator._async_update_data()
+
+        self.assertEqual(client.downloads, 0)
+        self.assertEqual(data[const.ATTR_NEXT_DOWNLOAD], datetime(2026, 11, 25, tzinfo=_BERLIN))
+
+    async def test_manual_download_ignores_the_schedule(self) -> None:
+        coordinator, client = self._coordinator(
+            _FakeStore({"readings": [], "last_download": (_NOW - timedelta(hours=1)).isoformat()})
+        )
         coordinator.async_refresh = AsyncMock(side_effect=coordinator._async_update_data)
 
         self.assertTrue(await coordinator.async_download_now())
@@ -637,9 +693,8 @@ class TestDeScheduledDownloads(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await coordinator.async_download_now())
 
     async def test_failed_download_keeps_stored_readings_and_retries(self) -> None:
-        old = (datetime.now(timezone.utc) - timedelta(days=40)).isoformat()
-        stored = [de_api_asdict(r) for r in await _DeFakeClient().async_get_meter_readings()]
-        store = _FakeStore({"readings": stored, "last_download": old})
+        old = datetime(2026, 10, 2, 0, 30, tzinfo=_BERLIN).isoformat()
+        store = _FakeStore({"readings": await self._stored_readings(), "last_download": old})
         coordinator, client = self._coordinator(store)
         client.fail = api.VattenfallApiError("down")
 
@@ -651,8 +706,10 @@ class TestDeScheduledDownloads(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(data["latest_meter_reading_value"], 12345.6)
         self.assertNotIn("meter_reading", data[const.ATTR_FAILED_GROUPS])
         self.assertEqual(data[const.ATTR_LAST_DOWNLOAD], datetime.fromisoformat(old))
+        # Retried at the next hourly update.
+        self.assertEqual(data[const.ATTR_NEXT_DOWNLOAD], _NOW + timedelta(hours=1))
         self.assertEqual(client.downloads, 2)
-        self.assertNotEqual(store.data["last_download"], old)
+        self.assertEqual(store.data["last_download"], _NOW.isoformat())
 
     async def test_refused_login_still_starts_reauthentication(self) -> None:
         coordinator, client = self._coordinator(_FakeStore())

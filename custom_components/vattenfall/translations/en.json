@@ -189,14 +189,14 @@
     "step": {
       "init": {
         "title": "Online Service options",
-        "description": "The electricity price is used for the Energy dashboard: Home Assistant cannot apply a fixed price to the meter reading consumption statistic, so the integration writes a matching cost statistic (Vattenfall Meter Reading Cost) from it. Leave it empty to stop writing costs. Data is downloaded from Vattenfall once per download interval; use the Download data now button to download earlier.",
+        "description": "The electricity price is used for the Energy dashboard: Home Assistant cannot apply a fixed price to the meter reading consumption statistic, so the integration writes a matching cost statistic (Vattenfall Meter Reading Cost) from it. Leave it empty to stop writing costs. Data is downloaded from Vattenfall once a month on the download day; use the Download data now button to download earlier.",
         "data": {
           "energy_price": "Electricity price",
-          "update_interval_days": "Download interval"
+          "download_day": "Download day of the month"
         },
         "data_description": {
           "energy_price": "Working price per kWh incl. VAT, e.g. 0.294 for 29.40 cent/kWh. It applies to the whole reading history.",
-          "update_interval_days": "Days between downloads from Vattenfall (default 30). Restarting Home Assistant does not download again before the interval has passed."
+          "download_day": "Day of the month (1–31) to download from Vattenfall, from midnight on (default 2, the day after readings are usually entered). Months with fewer days use their last day. Restarting Home Assistant does not download again before the next download day."
         }
       }
     }

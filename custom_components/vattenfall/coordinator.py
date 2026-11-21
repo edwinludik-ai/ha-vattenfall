@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import calendar
 from collections import Counter
 from dataclasses import asdict, fields
 from datetime import date, datetime, timedelta, timezone
@@ -41,10 +42,10 @@ from .const import (
     ATTR_TEMPERATURE_POINTS,
     ATTR_TEMPERATURE_START_DATE,
     ATTR_TRANSFER_FEE_INCL_VAT,
+    CONF_DOWNLOAD_DAY,
     CONF_ENERGY_PRICE,
     CONF_METERING_POINT_ID,
     CONF_TEMPERATURE_AREA_CODE,
-    CONF_UPDATE_INTERVAL_DAYS,
     DEFAULT_SCAN_INTERVAL,
     DEFAULT_TEMPERATURE_AREA_CODE,
     DOMAIN,
@@ -141,6 +142,31 @@ def _spread_meter_readings(
                 stamp = start + hour * 3600
                 hourly[stamp] = hourly.get(stamp, 0.0) + per_hour
     return hourly
+
+
+def _scheduled_in_month(year: int, month: int, day: int, tz: zoneinfo.ZoneInfo) -> datetime:
+    """Return local midnight of the download day in a month, or of its last day if shorter."""
+    return datetime(year, month, min(day, calendar.monthrange(year, month)[1]), tzinfo=tz)
+
+
+def _scheduled_download_before(now: datetime, day: int, tz: zoneinfo.ZoneInfo) -> datetime:
+    """Return the latest scheduled download time at or before now."""
+    local = now.astimezone(tz)
+    scheduled = _scheduled_in_month(local.year, local.month, day, tz)
+    if scheduled > now:
+        year, month = (local.year - 1, 12) if local.month == 1 else (local.year, local.month - 1)
+        scheduled = _scheduled_in_month(year, month, day, tz)
+    return scheduled
+
+
+def _scheduled_download_after(now: datetime, day: int, tz: zoneinfo.ZoneInfo) -> datetime:
+    """Return the first scheduled download time after now."""
+    local = now.astimezone(tz)
+    scheduled = _scheduled_in_month(local.year, local.month, day, tz)
+    if scheduled <= now:
+        year, month = (local.year + 1, 1) if local.month == 12 else (local.year, local.month + 1)
+        scheduled = _scheduled_in_month(year, month, day, tz)
+    return scheduled
 
 
 def _reading_day(reading: MeterReading) -> date:
@@ -280,16 +306,21 @@ class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._force_download = False
 
     @property
-    def download_interval(self) -> timedelta | None:
-        """Return the time between downloads, or None when every update downloads."""
-        default = getattr(self.client, "default_download_interval", None)
+    def download_day(self) -> int | None:
+        """Return the day of the month to download on, or None when every update downloads."""
+        default = getattr(self.client, "default_download_day", None)
         if default is None:
             return None
-        days = (getattr(self.entry, "options", None) or {}).get(CONF_UPDATE_INTERVAL_DAYS)
-        return timedelta(days=int(days)) if days else default
+        day = (getattr(self.entry, "options", None) or {}).get(CONF_DOWNLOAD_DAY)
+        return int(day) if day else default
+
+    @staticmethod
+    def _now() -> datetime:
+        """Return the current time (replaced in tests)."""
+        return datetime.now(timezone.utc)
 
     async def async_download_now(self) -> bool:
-        """Download from Vattenfall now, whatever the interval; return whether it worked."""
+        """Download from Vattenfall now, whatever the schedule; return whether it worked."""
         before = self._last_download
         self._force_download = True
         await self.async_refresh()
@@ -298,7 +329,7 @@ class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch latest data from API."""
         try:
-            if self.download_interval is not None:
+            if self.download_day is not None:
                 data = await self._async_scheduled_data()
             else:
                 data = await self._async_download()
@@ -349,21 +380,24 @@ class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
 
     async def _async_scheduled_data(self) -> dict[str, Any]:
-        """Download once per interval (or on request) and use stored data in between.
+        """Download on the download day (or on request) and use stored data in between.
 
-        Between downloads, the meter reading values are recalculated from the stored
-        readings, so values that depend on today's date stay current. A failed download
-        falls back to the stored readings and is retried at the next update.
+        A download is due once local midnight of the download day has passed since the
+        last download; the first update after setup always downloads. Between downloads,
+        the meter reading values are recalculated from the stored readings, so values
+        that depend on today's date stay current. A failed download falls back to the
+        stored readings and is retried at the next hourly update.
         """
         await self._async_load_meter_store()
-        interval = self.download_interval
-        assert interval is not None
+        day = self.download_day
+        assert day is not None
         stored = self._stored_meter_readings or []
-        now = datetime.now(timezone.utc)
+        now = self._now()
+        latest_scheduled = _scheduled_download_before(now, day, self._tz)
         due = (
             self._force_download
             or self._last_download is None
-            or now >= self._last_download + interval
+            or self._last_download < latest_scheduled
         )
         self._force_download = False
 
@@ -394,9 +428,11 @@ class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             data = self._stored_data()
 
         data[ATTR_LAST_DOWNLOAD] = self._last_download
-        data[ATTR_NEXT_DOWNLOAD] = (
-            self._last_download + interval if self._last_download is not None else now
-        )
+        if self._last_download is None or self._last_download < latest_scheduled:
+            # The due download failed; it is retried at the next update.
+            data[ATTR_NEXT_DOWNLOAD] = now + DEFAULT_SCAN_INTERVAL
+        else:
+            data[ATTR_NEXT_DOWNLOAD] = _scheduled_download_after(now, day, self._tz)
         return data
 
     def _stored_data(self) -> dict[str, Any]:
