@@ -174,5 +174,59 @@ class TestOnlineDeConfigFlow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["data"]["metering_point_id"], VK)
 
 
+class TestOnlineDeOptionsFlow(unittest.IsolatedAsyncioTestCase):
+    """The electricity price is an option of Online Service entries."""
+
+    def setUp(self) -> None:
+        vol_patch = patch.object(
+            config_flow,
+            "vol",
+            SimpleNamespace(
+                Schema=lambda schema: schema,
+                Optional=lambda key, description=None: (
+                    "optional",
+                    key,
+                    tuple(sorted((description or {}).items())),
+                ),
+            ),
+        )
+        vol_patch.start()
+        self.addCleanup(vol_patch.stop)
+
+    def _flow(self, options: dict):
+        entry = _online_de_entry()
+        entry.options = options
+        flow = config_flow.VattenfallConfigFlow.async_get_options_flow(entry)
+        flow.hass = SimpleNamespace(config=SimpleNamespace(currency="EUR"))
+        return flow
+
+    def test_only_online_de_entries_have_options(self) -> None:
+        entry = _online_de_entry()
+        self.assertTrue(config_flow.VattenfallConfigFlow.async_supports_options_flow(entry))
+        entry.data = {**entry.data, "account_type": const.ACCOUNT_TYPE_ELDISTRIBUTION}
+        self.assertFalse(config_flow.VattenfallConfigFlow.async_supports_options_flow(entry))
+
+    async def test_form_suggests_the_current_price(self) -> None:
+        result = await self._flow({const.CONF_ENERGY_PRICE: 0.294}).async_step_init()
+
+        self.assertEqual(result["type"], "form")
+        (key, value), = result["data_schema"].items()
+        self.assertEqual(
+            key, ("optional", const.CONF_ENERGY_PRICE, (("suggested_value", 0.294),))
+        )
+        self.assertEqual(value[1]["unit_of_measurement"], "EUR/kWh")
+
+    async def test_saving_stores_the_price(self) -> None:
+        result = await self._flow({}).async_step_init({const.CONF_ENERGY_PRICE: 0.294})
+
+        self.assertEqual(result["type"], "create_entry")
+        self.assertEqual(result["data"], {const.CONF_ENERGY_PRICE: 0.294})
+
+    async def test_clearing_the_price_removes_it(self) -> None:
+        result = await self._flow({const.CONF_ENERGY_PRICE: 0.294}).async_step_init({})
+
+        self.assertEqual(result["data"], {})
+
+
 if __name__ == "__main__":
     unittest.main()

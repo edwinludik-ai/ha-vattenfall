@@ -39,6 +39,7 @@ from .const import (
     ATTR_TEMPERATURE_POINTS,
     ATTR_TEMPERATURE_START_DATE,
     ATTR_TRANSFER_FEE_INCL_VAT,
+    CONF_ENERGY_PRICE,
     CONF_METERING_POINT_ID,
     CONF_TEMPERATURE_AREA_CODE,
     DEFAULT_SCAN_INTERVAL,
@@ -265,8 +266,8 @@ class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._tz: zoneinfo.ZoneInfo = getattr(client, "api_timezone", _API_TIMEZONE)
         self._contract_cache: dict[str, Any] | None = None
         self._contract_cache_time: datetime | None = None
-        # Meter readings the statistics were last written for, to write only on change.
-        self._meter_statistics_readings: list[MeterReading] | None = None
+        # Meter readings and price the statistics were last written for, to write only on change.
+        self._meter_statistics_input: tuple[list[MeterReading], float | None] | None = None
         # Local copy of the reading history, merged with every fetch (created on first use).
         self._meter_reading_store: Any = None
         self._stored_meter_readings: list[MeterReading] | None = None
@@ -699,12 +700,15 @@ class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER.debug("Wrote %d temperature statistics for %s", len(stats), statistic_id)
 
     async def _async_write_meter_reading_statistics(self, readings: list[MeterReading]) -> None:
-        """Write hourly consumption spread between meter readings as an external statistic.
+        """Write hourly consumption spread between meter readings as external statistics.
 
         For contracts with only meter readings (no Lastgang), this is what the Energy
-        dashboard can use. The series is rebuilt from all readings whenever they change.
+        dashboard can use: a kWh statistic and, with an electricity price set in the
+        options, a cost statistic. Both are rebuilt whenever readings or price change.
         """
-        if readings == self._meter_statistics_readings:
+        price = (getattr(self.entry, "options", None) or {}).get(CONF_ENERGY_PRICE)
+        written_for = (list(readings), price)
+        if written_for == self._meter_statistics_input:
             return
         hourly = _spread_meter_readings(readings, self._tz)
         if hourly:
@@ -714,31 +718,59 @@ class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             from homeassistant.util.unit_conversion import EnergyConverter  # noqa: PLC0415
 
             metering_point_id: str = self.entry.data[CONF_METERING_POINT_ID]
-            statistic_id = f"{DOMAIN}:meter_reading_consumption_{metering_point_id.lower()}"
-            total = 0.0
-            stats: list[StatisticData] = []
-            for start in sorted(hourly):
-                total += hourly[start]
-                stats.append(
-                    StatisticData(
-                        start=datetime.fromtimestamp(start, timezone.utc),
-                        state=round(hourly[start], 4),
-                        sum=round(total, 4),
+            prefix = metering_point_id.lower()
+
+            def _statistics(factor: float) -> list[StatisticData]:
+                total = 0.0
+                stats: list[StatisticData] = []
+                for start in sorted(hourly):
+                    total += hourly[start]
+                    stats.append(
+                        StatisticData(
+                            start=datetime.fromtimestamp(start, timezone.utc),
+                            state=round(hourly[start] * factor, 4),
+                            sum=round(total * factor, 4),
+                        )
                     )
-                )
-            metadata = StatisticMetaData(
-                has_mean=False,
-                has_sum=True,
-                mean_type=StatisticMeanType.NONE,
-                name=f"Vattenfall Meter Reading Consumption {metering_point_id}",
-                source=DOMAIN,
-                statistic_id=statistic_id,
-                unit_class=EnergyConverter.UNIT_CLASS,
-                unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+                return stats
+
+            statistic_id = f"{DOMAIN}:meter_reading_consumption_{prefix}"
+            stats = _statistics(1.0)
+            async_add_external_statistics(
+                self.hass,
+                StatisticMetaData(
+                    has_mean=False,
+                    has_sum=True,
+                    mean_type=StatisticMeanType.NONE,
+                    name=f"Vattenfall Meter Reading Consumption {metering_point_id}",
+                    source=DOMAIN,
+                    statistic_id=statistic_id,
+                    unit_class=EnergyConverter.UNIT_CLASS,
+                    unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+                ),
+                stats,
             )
-            async_add_external_statistics(self.hass, metadata, stats)
             _LOGGER.debug("Wrote %d meter reading statistics for %s", len(stats), statistic_id)
-        self._meter_statistics_readings = list(readings)
+
+            if price is not None:
+                statistic_id = f"{DOMAIN}:meter_reading_cost_{prefix}"
+                stats = _statistics(float(price))
+                async_add_external_statistics(
+                    self.hass,
+                    StatisticMetaData(
+                        has_mean=False,
+                        has_sum=True,
+                        mean_type=StatisticMeanType.NONE,
+                        name=f"Vattenfall Meter Reading Cost {metering_point_id}",
+                        source=DOMAIN,
+                        statistic_id=statistic_id,
+                        unit_class=None,
+                        unit_of_measurement=self.hass.config.currency,
+                    ),
+                    stats,
+                )
+                _LOGGER.debug("Wrote %d meter reading cost statistics for %s", len(stats), statistic_id)
+        self._meter_statistics_input = written_for
 
     async def _async_merged_sum_statistics(
         self, statistic_id: str, new_values: dict[float, float]

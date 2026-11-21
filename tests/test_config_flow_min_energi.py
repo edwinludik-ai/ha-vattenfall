@@ -63,8 +63,16 @@ def _install_config_flow_stubs() -> None:
         def _get_reconfigure_entry(self):
             return self.entry
 
+    class OptionsFlow:
+        def async_show_form(self, **kwargs):  # noqa: ANN003
+            return {"type": "form", **kwargs}
+
+        def async_create_entry(self, title=None, data=None):  # noqa: ANN001
+            return {"type": "create_entry", "title": title, "data": data}
+
     config_entries = sys.modules["homeassistant.config_entries"]
     config_entries.ConfigFlow = ConfigFlow
+    config_entries.OptionsFlow = OptionsFlow
     sys.modules["homeassistant.const"].CONF_NAME = "name"
 
     data_entry_flow = ModuleType("homeassistant.data_entry_flow")
@@ -79,6 +87,9 @@ def _install_config_flow_stubs() -> None:
     selector.TextSelector = lambda config: ("text", config)
     selector.TextSelectorConfig = lambda **kwargs: kwargs
     selector.TextSelectorType = SimpleNamespace(PASSWORD="password")
+    selector.NumberSelector = lambda config: ("number", config)
+    selector.NumberSelectorConfig = lambda **kwargs: kwargs
+    selector.NumberSelectorMode = SimpleNamespace(BOX="box")
     sys.modules.setdefault("homeassistant.helpers.selector", selector)
 
 

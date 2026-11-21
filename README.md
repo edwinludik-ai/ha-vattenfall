@@ -170,6 +170,12 @@ hours between their reading dates. Pick it as grid consumption in `Settings` -> 
 match your readings; daily and hourly values are averages. It covers all readings on the portal and is extended when a
 new reading appears.
 
+Home Assistant cannot apply a fixed price to an external statistic. To track costs, open the entry's `Configure` dialog
+and enter your electricity price per kWh (e.g. `0.294` for 29.40 cent/kWh). The integration then also writes
+`Vattenfall Meter Reading Cost` (`vattenfall:meter_reading_cost_<contract>`) in your Home Assistant currency; pick it
+under "Use an entity tracking the total costs" for the grid consumption. The price applies to the whole history and
+does not include the monthly base fee.
+
 There are no outdoor temperature or grid fee sensors for Germany, and no 15-minute data. Note that Vattenfall may
 demand a captcha (`FriendlyCaptcha`) for logins from unfamiliar clients; if setup fails with a connection error,
 log in once in a browser at `online.vattenfall.de` and try again.

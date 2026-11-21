@@ -173,5 +173,19 @@
         "name": "Estimated current meter reading"
       }
     }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Electricity price",
+        "description": "Price per kWh for the Energy dashboard. Home Assistant cannot apply a fixed price to the meter reading consumption statistic, so the integration writes a matching cost statistic (Vattenfall Meter Reading Cost) from this price. Leave empty to stop writing costs.",
+        "data": {
+          "energy_price": "Electricity price"
+        },
+        "data_description": {
+          "energy_price": "Working price per kWh incl. VAT, e.g. 0.294 for 29.40 cent/kWh. It applies to the whole reading history."
+        }
+      }
+    }
   }
 }

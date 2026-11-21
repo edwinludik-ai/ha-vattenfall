@@ -12,6 +12,9 @@ from homeassistant.const import CONF_NAME
 from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers.httpx_client import get_async_client
 from homeassistant.helpers.selector import (
+    NumberSelector,
+    NumberSelectorConfig,
+    NumberSelectorMode,
     TextSelector,
     TextSelectorConfig,
     TextSelectorType,
@@ -30,6 +33,7 @@ from .const import (
     ACCOUNT_TYPE_ONLINE_DE,
     CONF_ACCOUNT_TYPE,
     CONF_CUSTOMER_ID,
+    CONF_ENERGY_PRICE,
     CONF_METERING_POINT_ID,
     CONF_PASSWORD,
     CONF_SUBSCRIPTION_KEY,
@@ -73,6 +77,18 @@ class VattenfallConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     VERSION = 1
     # 1.2: Min energi entries use a prefixed unique ID.
     MINOR_VERSION = 2
+
+    @staticmethod
+    def async_get_options_flow(
+        config_entry: config_entries.ConfigEntry,
+    ) -> VattenfallOptionsFlow:
+        """Return the options flow."""
+        return VattenfallOptionsFlow(config_entry)
+
+    @classmethod
+    def async_supports_options_flow(cls, config_entry: config_entries.ConfigEntry) -> bool:
+        """Only Online Service entries have options (the electricity price)."""
+        return _is_online_de(config_entry.data)
 
     def __init__(self) -> None:
         """Initialize flow state shared between multi-contract account steps."""
@@ -454,3 +470,35 @@ class VattenfallConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         schema = vol.Schema({**fields, **(extra_fields or {})})
 
         return self.async_show_form(step_id=step_id, data_schema=schema, errors=errors)
+
+
+class VattenfallOptionsFlow(config_entries.OptionsFlow):
+    """Set the electricity price used for the meter reading cost statistic."""
+
+    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
+        """Keep the entry; self.config_entry is set by Home Assistant only from 2024.11."""
+        self._entry = config_entry
+
+    async def async_step_init(self, user_input: dict[str, Any] | None = None) -> FlowResult:
+        """Ask for the price per kWh; leaving it empty removes it."""
+        if user_input is not None:
+            return self.async_create_entry(title="", data=dict(user_input))
+
+        currency = self.hass.config.currency
+        schema = vol.Schema(
+            {
+                vol.Optional(
+                    CONF_ENERGY_PRICE,
+                    description={"suggested_value": self._entry.options.get(CONF_ENERGY_PRICE)},
+                ): NumberSelector(
+                    NumberSelectorConfig(
+                        min=0,
+                        max=10,
+                        step=0.0001,
+                        mode=NumberSelectorMode.BOX,
+                        unit_of_measurement=f"{currency}/kWh",
+                    )
+                ),
+            }
+        )
+        return self.async_show_form(step_id="init", data_schema=schema)

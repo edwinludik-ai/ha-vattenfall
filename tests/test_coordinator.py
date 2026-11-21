@@ -52,7 +52,7 @@ def _recorder_modules(recorder: _FakeRecorder) -> dict[str, ModuleType]:
 
 
 def _coordinator(client: object | None = None):
-    entry = SimpleNamespace(entry_id="entry-1", data={"metering_point_id": "HDG1"})
+    entry = SimpleNamespace(entry_id="entry-1", data={"metering_point_id": "HDG1"}, options={})
     coordinator = coordinator_mod.VattenfallDataUpdateCoordinator(
         hass=SimpleNamespace(), client=client, entry=entry
     )
@@ -439,6 +439,40 @@ class MeterReadingStatisticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stats[0]["state"], 1.0)
         self.assertEqual(stats[-1]["sum"], 48.0)
         self.assertEqual(recorder.calls[1][1][-1]["sum"], 72.0)
+
+    async def test_cost_statistics_follow_the_configured_price(self) -> None:
+        coordinator = _coordinator()
+        coordinator._tz = _BERLIN
+        coordinator.hass = SimpleNamespace(config=SimpleNamespace(currency="EUR"))
+        readings = [_reading("2026-10-01", 10000.0), _reading("2026-10-03", 10048.0)]
+        recorder = _StatsRecorder()
+        const_mod = sys.modules["homeassistant.const"]
+
+        with patch.dict(sys.modules, _statistics_modules(recorder)), patch.object(
+            const_mod, "UnitOfEnergy", SimpleNamespace(KILO_WATT_HOUR="kWh"), create=True
+        ):
+            coordinator.entry.options = {"energy_price": 0.25}
+            await coordinator._async_write_meter_reading_statistics(readings)
+            coordinator.entry.options = {"energy_price": 0.3}
+            await coordinator._async_write_meter_reading_statistics(readings)
+
+        ids = [metadata["statistic_id"] for metadata, _stats in recorder.calls]
+        self.assertEqual(
+            ids,
+            [
+                "vattenfall:meter_reading_consumption_hdg1",
+                "vattenfall:meter_reading_cost_hdg1",
+                "vattenfall:meter_reading_consumption_hdg1",
+                "vattenfall:meter_reading_cost_hdg1",
+            ],
+        )
+        cost_metadata, cost_stats = recorder.calls[1]
+        self.assertEqual(cost_metadata["unit_of_measurement"], "EUR")
+        self.assertIsNone(cost_metadata["unit_class"])
+        self.assertTrue(cost_metadata["has_sum"])
+        self.assertEqual(cost_stats[0]["state"], 0.25)
+        self.assertEqual(cost_stats[-1]["sum"], 12.0)
+        self.assertEqual(recorder.calls[3][1][-1]["sum"], 14.4)
 
     async def test_update_writes_statistics_from_meter_reading_points(self) -> None:
         client = SimpleNamespace(supports_meter_readings=True)
