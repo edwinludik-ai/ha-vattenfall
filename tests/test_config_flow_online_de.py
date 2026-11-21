@@ -215,12 +215,19 @@ class TestOnlineDeOptionsFlow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(price[1]["unit_of_measurement"], "EUR/kWh")
         day = schema[("optional", const.CONF_DOWNLOAD_DAY, (("suggested_value", 2),))]
         self.assertEqual((day[1]["min"], day[1]["max"]), (1, 31))
+        periods = schema[("optional", const.CONF_FORECAST_PERIODS, (("suggested_value", 3),))]
+        self.assertEqual((periods[1]["min"], periods[1]["max"]), (1, 12))
 
     async def test_download_day_is_stored_as_a_whole_number(self) -> None:
-        result = await self._flow({}).async_step_init({const.CONF_DOWNLOAD_DAY: 5.0})
+        result = await self._flow({}).async_step_init(
+            {const.CONF_DOWNLOAD_DAY: 5.0, const.CONF_FORECAST_PERIODS: 2.0}
+        )
 
-        self.assertEqual(result["data"], {const.CONF_DOWNLOAD_DAY: 5})
+        self.assertEqual(
+            result["data"], {const.CONF_DOWNLOAD_DAY: 5, const.CONF_FORECAST_PERIODS: 2}
+        )
         self.assertIsInstance(result["data"][const.CONF_DOWNLOAD_DAY], int)
+        self.assertIsInstance(result["data"][const.CONF_FORECAST_PERIODS], int)
 
     async def test_saving_stores_the_price(self) -> None:
         result = await self._flow({}).async_step_init({const.CONF_ENERGY_PRICE: 0.294})

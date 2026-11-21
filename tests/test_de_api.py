@@ -478,6 +478,7 @@ class TestDeCoordinatorData(unittest.IsolatedAsyncioTestCase):
         coordinator._tz = ZoneInfo("Europe/Berlin")
         coordinator._meter_reading_store = _FakeStore()
         coordinator._stored_meter_readings = None
+        coordinator.entry = SimpleNamespace(entry_id="entry-1", data={}, options={})
 
         data = await coordinator._async_build_data(
             daily_start=date(2026, 2, 1),
@@ -511,6 +512,7 @@ class TestDeMeterReadingStore(unittest.IsolatedAsyncioTestCase):
         coordinator._tz = ZoneInfo("Europe/Berlin")
         coordinator._meter_reading_store = store
         coordinator._stored_meter_readings = None
+        coordinator.entry = SimpleNamespace(entry_id="entry-1", data={}, options={})
         return coordinator
 
     async def test_stored_readings_are_kept_and_saved_only_on_change(self) -> None:

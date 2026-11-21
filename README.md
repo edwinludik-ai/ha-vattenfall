@@ -157,7 +157,10 @@ even if the portal stops returning them. From it, the integration derives:
 - `Consumption since previous reading` and `Daily average since previous reading`;
 - `Daily average last 12 months` and `Projected yearly consumption` (that average times 365);
 - `Consumption this year`, up to the latest reading, with the period around New Year split by days;
-- `Estimated current meter reading`: the latest reading plus the latest daily average for each day since.
+- `Forecast since last reading` and `Forecast daily average`: the consumption from the last reading up to today, at
+  the average per day of the latest reading periods (3 by default, set in `Configure`), with one value per day in the
+  `points` attribute;
+- `Estimated current meter reading`: the latest reading plus that average for each day since.
 
 #### Contracts with only meter readings
 
@@ -168,8 +171,10 @@ says there is no `Lastgang` for the contract.
 For the Energy dashboard, the integration turns the readings into the statistic `Vattenfall Meter Reading Consumption`
 (`vattenfall:meter_reading_consumption_<contract>`): the consumption between two readings is spread evenly over the
 hours between their reading dates. Pick it as grid consumption in `Settings` -> `Dashboards` -> `Energy`. Monthly totals
-match your readings; daily and hourly values are averages. It covers all readings on the portal and is extended when a
-new reading appears.
+match your readings; daily and hourly values are averages. After the last reading, the statistic continues up to today
+with the forecast (the average per day of the latest reading periods), extended each day. When a new reading arrives,
+the whole statistic is recalculated from the readings, so the forecast days up to the new reading are replaced by the
+real consumption and the forecast starts again from the new reading.
 
 #### Download schedule
 

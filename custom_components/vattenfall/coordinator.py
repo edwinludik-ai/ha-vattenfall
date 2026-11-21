@@ -44,8 +44,10 @@ from .const import (
     ATTR_TRANSFER_FEE_INCL_VAT,
     CONF_DOWNLOAD_DAY,
     CONF_ENERGY_PRICE,
+    CONF_FORECAST_PERIODS,
     CONF_METERING_POINT_ID,
     CONF_TEMPERATURE_AREA_CODE,
+    DEFAULT_FORECAST_PERIODS,
     DEFAULT_SCAN_INTERVAL,
     DEFAULT_TEMPERATURE_AREA_CODE,
     DOMAIN,
@@ -188,12 +190,88 @@ def _merge_meter_readings(
     return sorted(merged.values(), key=_reading_day)
 
 
+def _meter_series(readings: list[MeterReading]) -> list[list[MeterReading]]:
+    """Group readings per meter and register, each sorted by day."""
+    series: dict[tuple[str, str | None], list[MeterReading]] = {}
+    for reading in readings:
+        series.setdefault((reading.meter_number, reading.register), []).append(reading)
+    return [sorted(points, key=_reading_day) for points in series.values()]
+
+
+def _series_daily_average(
+    points: list[MeterReading], periods: int
+) -> tuple[float, date] | None:
+    """Return kWh per day over the last `periods` reading periods and where that starts."""
+    if len(points) < 2:
+        return None
+    baseline = points[max(0, len(points) - 1 - periods)]
+    days = (_reading_day(points[-1]) - _reading_day(baseline)).days
+    if days <= 0 or points[-1].value < baseline.value:
+        return None
+    return (points[-1].value - baseline.value) / days, _reading_day(baseline)
+
+
+def _forecast_daily_kwh(
+    readings: list[MeterReading], periods: int
+) -> tuple[float, date, date] | None:
+    """Return the forecast kWh per day after the newest reading.
+
+    Adds up the average of every register read on the newest reading day (both registers
+    of a two-tariff meter). Returns (kWh per day, newest reading day, average start).
+    """
+    if not readings:
+        return None
+    latest_day = max(_reading_day(reading) for reading in readings)
+    total = 0.0
+    since: date | None = None
+    for points in _meter_series(readings):
+        if _reading_day(points[-1]) != latest_day:
+            continue
+        average = _series_daily_average(points, periods)
+        if average is None:
+            continue
+        total += average[0]
+        since = average[1] if since is None else min(since, average[1])
+    if since is None:
+        return None
+    return total, latest_day, since
+
+
+def _forecast_hours(
+    readings: list[MeterReading],
+    periods: int,
+    today: date,
+    tz: zoneinfo.ZoneInfo = _API_TIMEZONE,
+) -> dict[float, float]:
+    """Spread the forecast kWh per day over the hours from the newest reading to today.
+
+    Covers whole days from local midnight of the newest reading day up to (not
+    including) today, keyed like _spread_meter_readings, so it continues that series.
+    """
+    forecast = _forecast_daily_kwh(readings, periods)
+    if forecast is None:
+        return {}
+    daily_kwh, day, _since = forecast
+    hourly: dict[float, float] = {}
+    while day < today:
+        start = _day_start(day.isoformat(), tz).timestamp()
+        hours = _hours_in_day(day.isoformat(), tz)
+        for hour in range(hours):
+            hourly[start + hour * 3600] = daily_kwh / hours
+        day += timedelta(days=1)
+    return hourly
+
+
 def _meter_reading_summary(
-    readings: list[MeterReading], today: date, tz: zoneinfo.ZoneInfo = _API_TIMEZONE
+    readings: list[MeterReading],
+    today: date,
+    tz: zoneinfo.ZoneInfo = _API_TIMEZONE,
+    forecast_periods: int = DEFAULT_FORECAST_PERIODS,
 ) -> dict[str, Any]:
     """Derive the meter reading sensor values from the reading history.
 
-    Periods use the series (meter and register) of the newest reading.
+    Periods use the series (meter and register) of the newest reading; the forecast
+    adds up all registers read on the newest reading day.
     """
     summary: dict[str, Any] = {
         "latest_meter_reading_time": None,
@@ -207,6 +285,9 @@ def _meter_reading_summary(
         "meter_this_year_attributes": {},
         "meter_estimated_reading": None,
         "meter_estimated_attributes": {},
+        "meter_forecast_kwh": None,
+        "meter_forecast_daily_kwh": None,
+        "meter_forecast_attributes": {},
     }
     if not readings:
         return summary
@@ -261,10 +342,31 @@ def _meter_reading_summary(
             "until": latest_day.isoformat(),
         }
 
-    daily_kwh = summary["meter_period_daily_kwh"]
     days_since = (today - latest_day).days
-    if daily_kwh is not None and days_since >= 0:
-        summary["meter_estimated_reading"] = round(latest.value + daily_kwh * days_since, 1)
+    forecast = _forecast_daily_kwh(readings, forecast_periods)
+    if forecast is not None and days_since >= 0:
+        daily_kwh = round(forecast[0], 3)
+        summary["meter_forecast_daily_kwh"] = daily_kwh
+        summary["meter_forecast_kwh"] = round(forecast[0] * days_since, 1)
+        summary["meter_forecast_attributes"] = {
+            "since": latest_day.isoformat(),
+            "until": today.isoformat(),
+            "days": days_since,
+            "daily_kwh": daily_kwh,
+            "average_since": forecast[2].isoformat(),
+            "average_periods": forecast_periods,
+            "points": [
+                {"date": (latest_day + timedelta(days=offset)).isoformat(), "kwh": daily_kwh}
+                for offset in range(days_since)
+            ],
+        }
+
+    latest_average = _series_daily_average(series, forecast_periods)
+    if latest_average is not None and days_since >= 0:
+        daily_kwh = round(latest_average[0], 3)
+        summary["meter_estimated_reading"] = round(
+            latest.value + latest_average[0] * days_since, 1
+        )
         summary["meter_estimated_attributes"] = {
             "days_since_reading": days_since,
             "daily_kwh": daily_kwh,
@@ -296,7 +398,9 @@ class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._contract_cache: dict[str, Any] | None = None
         self._contract_cache_time: datetime | None = None
         # Meter readings and price the statistics were last written for, to write only on change.
-        self._meter_statistics_input: tuple[list[MeterReading], float | None] | None = None
+        self._meter_statistics_input: tuple[list[MeterReading], float | None, int] | None = None
+        # Day the forecast in the statistics was last extended to.
+        self._meter_statistics_today: date | None = None
         # Local copy of the reading history, merged with every fetch (created on first use).
         self._meter_reading_store: Any = None
         self._stored_meter_readings: list[MeterReading] | None = None
@@ -318,6 +422,16 @@ class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _now() -> datetime:
         """Return the current time (replaced in tests)."""
         return datetime.now(timezone.utc)
+
+    @property
+    def forecast_periods(self) -> int:
+        """Return how many of the latest reading periods the forecast averages."""
+        periods = (getattr(self.entry, "options", None) or {}).get(CONF_FORECAST_PERIODS)
+        return int(periods) if periods else DEFAULT_FORECAST_PERIODS
+
+    def _today(self) -> date:
+        """Return today's date in the API timezone."""
+        return self._now().astimezone(self._tz).date()
 
     async def async_download_now(self) -> bool:
         """Download from Vattenfall now, whatever the schedule; return whether it worked."""
@@ -713,7 +827,7 @@ class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             }
             if latest
             else {},
-            **_meter_reading_summary(readings, date.today(), self._tz),
+            **_meter_reading_summary(readings, self._today(), self._tz, self.forecast_periods),
             ATTR_METER_READING_POINTS: [asdict(reading) for reading in readings],
         }
 
@@ -853,14 +967,29 @@ class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         For contracts with only meter readings (no Lastgang), this is what the Energy
         dashboard can use: a kWh statistic and, with an electricity price set in the
-        options, a cost statistic. Both are rebuilt whenever readings or price change.
+        options, a cost statistic. After the newest reading, the series continues up to
+        today with the forecast (the average of the latest reading periods).
+
+        When the readings, price or forecast setting change, the whole series is rebuilt
+        from the readings, so a new reading replaces the forecast for its period. On a
+        new day otherwise, only the forecast part is written again, one day longer.
         """
         price = (getattr(self.entry, "options", None) or {}).get(CONF_ENERGY_PRICE)
-        written_for = (list(readings), price)
+        periods = self.forecast_periods
+        today = self._today()
+        written_for = (list(readings), price, periods)
         if written_for == self._meter_statistics_input:
-            return
-        hourly = _spread_meter_readings(readings, self._tz)
-        if hourly:
+            if today == self._meter_statistics_today:
+                return
+            rebuild = False
+        else:
+            rebuild = True
+        spread = _spread_meter_readings(readings, self._tz)
+        forecast = _forecast_hours(readings, periods, today, self._tz)
+        hourly = {**spread, **forecast}
+        # Without a rebuild, only rows from the start of the forecast change.
+        write_from = float("-inf") if rebuild or not forecast else min(forecast)
+        if hourly and (rebuild or forecast):
             from homeassistant.components.recorder.models import StatisticData, StatisticMeanType, StatisticMetaData  # noqa: PLC0415
             from homeassistant.components.recorder.statistics import async_add_external_statistics  # noqa: PLC0415
             from homeassistant.const import UnitOfEnergy  # noqa: PLC0415
@@ -874,6 +1003,8 @@ class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 stats: list[StatisticData] = []
                 for start in sorted(hourly):
                     total += hourly[start]
+                    if start < write_from:
+                        continue
                     stats.append(
                         StatisticData(
                             start=datetime.fromtimestamp(start, timezone.utc),
@@ -920,6 +1051,7 @@ class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
                 _LOGGER.debug("Wrote %d meter reading cost statistics for %s", len(stats), statistic_id)
         self._meter_statistics_input = written_for
+        self._meter_statistics_today = today
 
     async def _async_merged_sum_statistics(
         self, statistic_id: str, new_values: dict[float, float]

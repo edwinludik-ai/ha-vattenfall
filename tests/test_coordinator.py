@@ -415,6 +415,7 @@ class MeterReadingStatisticsTests(unittest.IsolatedAsyncioTestCase):
     async def test_statistics_are_written_once_per_set_of_readings(self) -> None:
         coordinator = _coordinator()
         coordinator._tz = _BERLIN
+        coordinator._now = lambda: datetime(2026, 10, 3, 12, tzinfo=_BERLIN)
         readings = [_reading("2026-10-01", 10000.0), _reading("2026-10-03", 10048.0)]
         recorder = _StatsRecorder()
         const_mod = sys.modules["homeassistant.const"]
@@ -424,6 +425,7 @@ class MeterReadingStatisticsTests(unittest.IsolatedAsyncioTestCase):
         ):
             await coordinator._async_write_meter_reading_statistics(readings)
             await coordinator._async_write_meter_reading_statistics(list(readings))
+            coordinator._now = lambda: datetime(2026, 10, 4, 12, tzinfo=_BERLIN)
             await coordinator._async_write_meter_reading_statistics(
                 [*readings, _reading("2026-10-04", 10072.0)]
             )
@@ -443,6 +445,7 @@ class MeterReadingStatisticsTests(unittest.IsolatedAsyncioTestCase):
     async def test_cost_statistics_follow_the_configured_price(self) -> None:
         coordinator = _coordinator()
         coordinator._tz = _BERLIN
+        coordinator._now = lambda: datetime(2026, 10, 3, 12, tzinfo=_BERLIN)
         coordinator.hass = SimpleNamespace(config=SimpleNamespace(currency="EUR"))
         readings = [_reading("2026-10-01", 10000.0), _reading("2026-10-03", 10048.0)]
         recorder = _StatsRecorder()
@@ -473,6 +476,60 @@ class MeterReadingStatisticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cost_stats[0]["state"], 0.25)
         self.assertEqual(cost_stats[-1]["sum"], 12.0)
         self.assertEqual(recorder.calls[3][1][-1]["sum"], 14.4)
+
+    async def _write(self, coordinator, readings, now, recorder) -> None:
+        const_mod = sys.modules["homeassistant.const"]
+        coordinator._now = lambda: now
+        with patch.dict(sys.modules, _statistics_modules(recorder)), patch.object(
+            const_mod, "UnitOfEnergy", SimpleNamespace(KILO_WATT_HOUR="kWh"), create=True
+        ):
+            await coordinator._async_write_meter_reading_statistics(readings)
+
+    async def test_forecast_fills_the_days_since_the_last_reading(self) -> None:
+        coordinator = _coordinator()
+        coordinator._tz = _BERLIN
+        recorder = _StatsRecorder()
+        # 24 kWh per day: 1 kWh per hour.
+        readings = [_reading("2026-10-01", 10000.0), _reading("2026-10-03", 10048.0)]
+
+        await self._write(coordinator, readings, datetime(2026, 10, 5, 12, tzinfo=_BERLIN), recorder)
+        # A day later only the forecast part is written again, extended by one day.
+        await self._write(coordinator, readings, datetime(2026, 10, 6, 9, tzinfo=_BERLIN), recorder)
+        # Nothing new within the same day.
+        await self._write(coordinator, readings, datetime(2026, 10, 6, 20, tzinfo=_BERLIN), recorder)
+
+        self.assertEqual(len(recorder.calls), 2)
+        first = recorder.calls[0][1]
+        self.assertEqual(len(first), 48 + 48)
+        self.assertEqual(first[-1]["start"], datetime(2026, 10, 4, 23, tzinfo=_BERLIN))
+        self.assertEqual(first[-1]["sum"], 96.0)
+        second = recorder.calls[1][1]
+        self.assertEqual(second[0]["start"], datetime(2026, 10, 3, tzinfo=_BERLIN))
+        self.assertEqual(second[0]["sum"], 49.0)
+        self.assertEqual(len(second), 72)
+        self.assertEqual(second[-1]["sum"], 120.0)
+
+    async def test_new_reading_replaces_the_forecast(self) -> None:
+        coordinator = _coordinator()
+        coordinator._tz = _BERLIN
+        recorder = _StatsRecorder()
+        readings = [_reading("2026-10-01", 10000.0), _reading("2026-10-03", 10048.0)]
+        await self._write(coordinator, readings, datetime(2026, 10, 6, 12, tzinfo=_BERLIN), recorder)
+
+        # The reading of 10-05 shows less than forecast: 12 kWh per day instead of 24.
+        readings = [*readings, _reading("2026-10-05", 10072.0)]
+        await self._write(coordinator, readings, datetime(2026, 10, 6, 13, tzinfo=_BERLIN), recorder)
+
+        rows = {row["start"]: row for row in recorder.calls[-1][1]}
+        # The whole series is rewritten from the first reading.
+        self.assertEqual(min(rows), datetime(2026, 10, 1, tzinfo=_BERLIN))
+        # 10-03 and 10-04 now come from the readings: 24 kWh over 48 hours.
+        self.assertEqual(rows[datetime(2026, 10, 3, tzinfo=_BERLIN)]["state"], 0.5)
+        self.assertEqual(rows[datetime(2026, 10, 5, tzinfo=_BERLIN)]["sum"], 72.75)
+        # 10-05 is forecast again, from the average of the last three periods (72 kWh / 4 days).
+        self.assertEqual(rows[datetime(2026, 10, 5, tzinfo=_BERLIN)]["state"], 0.75)
+        self.assertEqual(max(rows), datetime(2026, 10, 5, 23, tzinfo=_BERLIN))
+        self.assertEqual(rows[max(rows)]["sum"], 90.0)
 
     async def test_update_writes_statistics_from_meter_reading_points(self) -> None:
         client = SimpleNamespace(supports_meter_readings=True)
@@ -531,6 +588,51 @@ class MeterReadingSummaryTests(unittest.TestCase):
             summary["meter_estimated_attributes"], {"days_since_reading": 20, "daily_kwh": 3.0}
         )
 
+    def test_forecast_uses_the_last_reading_periods(self) -> None:
+        readings = [
+            _reading("2026-01-01", 1000.0),
+            _reading("2026-02-01", 1062.0),  # 31 days, 2 kWh/day
+            _reading("2026-03-01", 1146.0),  # 28 days, 3 kWh/day
+            _reading("2026-04-01", 1270.0),  # 31 days, 4 kWh/day
+        ]
+        today = date(2026, 4, 11)
+
+        one = coordinator_mod._meter_reading_summary(readings, today, _BERLIN, forecast_periods=1)
+        two = coordinator_mod._meter_reading_summary(readings, today, _BERLIN, forecast_periods=2)
+        three = coordinator_mod._meter_reading_summary(readings, today, _BERLIN, forecast_periods=3)
+        many = coordinator_mod._meter_reading_summary(readings, today, _BERLIN, forecast_periods=12)
+
+        self.assertEqual(one["meter_forecast_daily_kwh"], 4.0)
+        self.assertEqual(two["meter_forecast_daily_kwh"], round(208 / 59, 3))
+        self.assertEqual(three["meter_forecast_daily_kwh"], 3.0)
+        self.assertEqual(many["meter_forecast_daily_kwh"], 3.0)
+        self.assertEqual(three["meter_forecast_kwh"], 30.0)
+        self.assertEqual(three["meter_estimated_reading"], 1300.0)
+        attributes = three["meter_forecast_attributes"]
+        self.assertEqual(
+            {k: v for k, v in attributes.items() if k != "points"},
+            {
+                "since": "2026-04-01",
+                "until": "2026-04-11",
+                "days": 10,
+                "daily_kwh": 3.0,
+                "average_since": "2026-01-01",
+                "average_periods": 3,
+            },
+        )
+        self.assertEqual(len(attributes["points"]), 10)
+        self.assertEqual(attributes["points"][0], {"date": "2026-04-01", "kwh": 3.0})
+        self.assertEqual(attributes["points"][-1], {"date": "2026-04-10", "kwh": 3.0})
+
+    def test_no_forecast_on_the_reading_day(self) -> None:
+        readings = [_reading("2026-03-01", 1146.0), _reading("2026-04-01", 1270.0)]
+
+        summary = coordinator_mod._meter_reading_summary(readings, date(2026, 4, 1), _BERLIN)
+
+        self.assertEqual(summary["meter_forecast_kwh"], 0.0)
+        self.assertEqual(summary["meter_forecast_attributes"]["points"], [])
+        self.assertEqual(summary["meter_estimated_reading"], 1270.0)
+
     def test_single_reading_has_no_period(self) -> None:
         summary = coordinator_mod._meter_reading_summary(
             [_reading("2026-02-01", 1186.0)], date(2026, 2, 21), _BERLIN
@@ -539,6 +641,7 @@ class MeterReadingSummaryTests(unittest.TestCase):
         self.assertIsNone(summary["meter_period_kwh"])
         self.assertIsNone(summary["meter_yearly_daily_kwh"])
         self.assertIsNone(summary["meter_estimated_reading"])
+        self.assertIsNone(summary["meter_forecast_kwh"])
         self.assertIsNone(summary["meter_this_year_kwh"])
 
     def test_merge_keeps_stored_readings_and_prefers_fetched(self) -> None:

@@ -177,6 +177,12 @@
       },
       "next_download": {
         "name": "Next download"
+      },
+      "meter_forecast_consumption": {
+        "name": "Forecast since last reading"
+      },
+      "meter_forecast_daily_average": {
+        "name": "Forecast daily average"
       }
     },
     "button": {
@@ -192,11 +198,13 @@
         "description": "The electricity price is used for the Energy dashboard: Home Assistant cannot apply a fixed price to the meter reading consumption statistic, so the integration writes a matching cost statistic (Vattenfall Meter Reading Cost) from it. Leave it empty to stop writing costs. Data is downloaded from Vattenfall once a month on the download day; use the Download data now button to download earlier.",
         "data": {
           "energy_price": "Electricity price",
-          "download_day": "Download day of the month"
+          "download_day": "Download day of the month",
+          "forecast_periods": "Forecast: reading periods to average"
         },
         "data_description": {
           "energy_price": "Working price per kWh incl. VAT, e.g. 0.294 for 29.40 cent/kWh. It applies to the whole reading history.",
-          "download_day": "Day of the month (1–31) to download from Vattenfall, from midnight on (default 2, the day after readings are usually entered). Months with fewer days use their last day. Restarting Home Assistant does not download again before the next download day."
+          "download_day": "Day of the month (1–31) to download from Vattenfall, from midnight on (default 2, the day after readings are usually entered). Months with fewer days use their last day. Restarting Home Assistant does not download again before the next download day.",
+          "forecast_periods": "From the last reading to today, the Energy statistics and the forecast sensors use the average consumption per day of this many latest reading periods (default 3). A new reading replaces the forecast with the real values."
         }
       }
     }

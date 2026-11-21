@@ -17,6 +17,9 @@ CONF_ACCOUNT_TYPE = "account_type"
 CONF_ENERGY_PRICE = "energy_price"
 # Option: day of the month to download on, for clients that download on a schedule.
 CONF_DOWNLOAD_DAY = "download_day"
+# Option: how many of the latest reading periods the forecast since the last reading averages.
+CONF_FORECAST_PERIODS = "forecast_periods"
+DEFAULT_FORECAST_PERIODS = 3
 
 ACCOUNT_TYPE_ELDISTRIBUTION = "eldistribution"
 ACCOUNT_TYPE_MIN_ENERGI = "min_energi"
