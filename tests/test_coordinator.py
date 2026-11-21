@@ -551,3 +551,43 @@ class MeterReadingSummaryTests(unittest.TestCase):
             [(r.reading_date, r.value) for r in merged],
             [("2026-01-01", 100.0), ("2026-02-01T00:00:00", 151.0), ("2026-03-01", 200.0)],
         )
+
+
+class BackfillStatisticsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_backfill_writes_daily_statistics(self) -> None:
+        client = SimpleNamespace(
+            async_get_daily_consumption=AsyncMock(
+                return_value=[api.ConsumptionPoint(date="2026-03-01", value_kwh=5.0)]
+            ),
+        )
+        coordinator = _coordinator(client)
+        coordinator.async_request_refresh = AsyncMock()
+        recorder = _StatsRecorder()
+        modules = _statistics_modules(recorder)
+        modules.update(
+            {
+                key: value
+                for key, value in _recorder_modules(_FakeRecorder([])).items()
+                if key == "homeassistant.components.recorder"
+            }
+        )
+        modules["homeassistant.components.recorder.statistics"].statistics_during_period = (
+            _FakeRecorder([]).statistics_during_period
+        )
+        modules["homeassistant.util.unit_conversion"].TemperatureConverter = SimpleNamespace(
+            UNIT_CLASS="temperature"
+        )
+        const_mod = sys.modules["homeassistant.const"]
+
+        with patch.dict(sys.modules, modules), patch.object(
+            const_mod, "UnitOfEnergy", SimpleNamespace(KILO_WATT_HOUR="kWh"), create=True
+        ), patch.object(
+            const_mod, "UnitOfTemperature", SimpleNamespace(CELSIUS="°C"), create=True
+        ):
+            await coordinator.async_backfill_range(date(2026, 3, 1), date(2026, 3, 1), mode="daily")
+
+        self.assertEqual(
+            [metadata["statistic_id"] for metadata, _stats in recorder.calls],
+            ["vattenfall:daily_consumption_hdg1"],
+        )
+        self.assertEqual(recorder.calls[0][1][0]["sum"], 5.0)

@@ -15,13 +15,10 @@ from homeassistant.components.sensor import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory, UnitOfEnergy, UnitOfTemperature
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import (
-    ACCOUNT_TYPE_MIN_ENERGI,
-    ACCOUNT_TYPE_ONLINE_DE,
     ATTR_END_DATE,
     ATTR_ENERGY_TAX_INCL_VAT,
     ATTR_FAILED_GROUPS,
@@ -29,7 +26,9 @@ from .const import (
     ATTR_HOURLY_END_DATE,
     ATTR_HOURLY_POINTS,
     ATTR_HOURLY_START_DATE,
+    ATTR_LAST_DOWNLOAD,
     ATTR_METER_READING_POINTS,
+    ATTR_NEXT_DOWNLOAD,
     ATTR_POINTS,
     ATTR_QUARTER_HOUR_POINTS,
     ATTR_START_DATE,
@@ -37,10 +36,10 @@ from .const import (
     ATTR_TEMPERATURE_POINTS,
     ATTR_TEMPERATURE_START_DATE,
     ATTR_TRANSFER_FEE_INCL_VAT,
-    CONF_ACCOUNT_TYPE,
     DOMAIN,
 )
 from .coordinator import VattenfallDataUpdateCoordinator
+from .entity import vattenfall_device_info
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -302,6 +301,26 @@ SENSORS: tuple[VattenfallSensorEntityDescription, ...] = (
         attribute_group="meter_reading",
         attributes_key="meter_estimated_attributes",
     ),
+    VattenfallSensorEntityDescription(
+        key="last_download",
+        translation_key="last_download",
+        name="Last download",
+        device_class=SensorDeviceClass.TIMESTAMP,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_key=ATTR_LAST_DOWNLOAD,
+        icon="mdi:cloud-check",
+        attribute_group="schedule",
+    ),
+    VattenfallSensorEntityDescription(
+        key="next_download",
+        translation_key="next_download",
+        name="Next download",
+        device_class=SensorDeviceClass.TIMESTAMP,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_key=ATTR_NEXT_DOWNLOAD,
+        icon="mdi:cloud-clock",
+        attribute_group="schedule",
+    ),
 )
 
 
@@ -334,6 +353,10 @@ async def async_setup_entry(
             description.attribute_group != "temperature"
             or getattr(coordinator.client, "supports_temperature", True)
         )
+        and (
+            description.attribute_group != "schedule"
+            or coordinator.download_interval is not None
+        )
     ]
     async_add_entities(entities)
 
@@ -355,18 +378,7 @@ class VattenfallSensor(CoordinatorEntity[VattenfallDataUpdateCoordinator], Senso
         super().__init__(coordinator)
         self.entity_description = description
         self._attr_unique_id = f"{entry.entry_id}_{description.key}"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, entry.entry_id)},
-            # Min energi and Online Service accounts can have several contracts, so name
-            # devices after the entry.
-            name=(
-                entry.title
-                if entry.data.get(CONF_ACCOUNT_TYPE)
-                in (ACCOUNT_TYPE_MIN_ENERGI, ACCOUNT_TYPE_ONLINE_DE)
-                else "Vattenfall"
-            ),
-            manufacturer="Vattenfall",
-        )
+        self._attr_device_info = vattenfall_device_info(entry)
 
     @property
     def available(self) -> bool:
@@ -437,6 +449,9 @@ class VattenfallSensor(CoordinatorEntity[VattenfallDataUpdateCoordinator], Senso
                 "energy_tax_incl_vat": data.get(ATTR_ENERGY_TAX_INCL_VAT),
                 "fixed_fee_incl_vat_incl_discount": data.get(ATTR_FIXED_FEE_INCL_VAT_INCL_DISCOUNT),
             }
+        if group == "schedule":
+            interval = self.coordinator.download_interval
+            return {"interval_days": interval.days if interval else None}
         if group == "meter_reading":
             points = data.get(ATTR_METER_READING_POINTS, [])
             return {

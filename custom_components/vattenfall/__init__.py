@@ -27,7 +27,7 @@ from .const import (
 )
 from .coordinator import VattenfallDataUpdateCoordinator
 
-PLATFORMS: list[Platform] = [Platform.SENSOR]
+PLATFORMS: list[Platform] = [Platform.SENSOR, Platform.BUTTON]
 _LOGGER = logging.getLogger(__name__)
 
 BACKFILL_SERVICE_SCHEMA = vol.Schema(

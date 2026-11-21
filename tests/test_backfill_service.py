@@ -22,7 +22,7 @@ def _install_dependency_stubs() -> None:
     if "homeassistant.const" not in sys.modules:
         const_mod = ModuleType("homeassistant.const")
         const_mod.CONF_PASSWORD = "password"
-        const_mod.Platform = type("Platform", (), {"SENSOR": "sensor"})
+        const_mod.Platform = type("Platform", (), {"SENSOR": "sensor", "BUTTON": "button"})
         sys.modules["homeassistant.const"] = const_mod
 
     if "homeassistant.config_entries" not in sys.modules:

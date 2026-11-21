@@ -10,7 +10,8 @@ dashboards, Energy, and automations.
 ## Features
 
 - Config flow setup from Home Assistant UI, with re-authentication and reconfigure support
-- Hourly data updates via coordinator
+- Hourly data updates via coordinator (Online Service Germany: a download every 30 days by default, adjustable, plus a
+  `Download data now` button)
 - Consumption sensors:
   - Latest day consumption
   - Month-to-date consumption
@@ -170,6 +171,21 @@ hours between their reading dates. Pick it as grid consumption in `Settings` -> 
 match your readings; daily and hourly values are averages. It covers all readings on the portal and is extended when a
 new reading appears.
 
+#### Download schedule
+
+The German portal only changes when a reading is entered, so Online Service entries download from Vattenfall once every
+30 days instead of every hour. Change the `Download interval` (in days) in the entry's `Configure` dialog. The time of
+the last download is stored, so restarting Home Assistant does not download again before the interval has passed; in
+between, the sensors use the stored readings (and values that depend on today's date, such as the estimated current
+reading, keep moving). Consumption time series sensors, which smart meters have, are not stored and stay unavailable
+after a restart until the next download.
+
+To download right away, for example after entering a new reading, press the `Download data now` button on the device
+(or call `button.press` on it from an automation). `Last download` and `Next download` show the schedule. A failed
+download keeps the stored readings and is retried at the next hourly check.
+
+#### Electricity price
+
 Home Assistant cannot apply a fixed price to an external statistic. To track costs, open the entry's `Configure` dialog
 and enter your electricity price per kWh (e.g. `0.294` for 29.40 cent/kWh). The integration then also writes
 `Vattenfall Meter Reading Cost` (`vattenfall:meter_reading_cost_<contract>`) in your Home Assistant currency; pick it
@@ -182,7 +198,7 @@ log in once in a browser at `online.vattenfall.de` and try again.
 
 ## Notes
 
-- The integration is configured to update consumption data every hour.
+- The integration is configured to update consumption data every hour (Online Service Germany: see Download schedule).
 - Vattenfall publishes data about once a day. "Latest day" sensors show the newest full day before today, named in their
   `latest_day` attribute.
 - Runtime dependency `httpx[http2]` is declared in `manifest.json` and installed by Home Assistant.

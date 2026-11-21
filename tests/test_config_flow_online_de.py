@@ -210,11 +210,17 @@ class TestOnlineDeOptionsFlow(unittest.IsolatedAsyncioTestCase):
         result = await self._flow({const.CONF_ENERGY_PRICE: 0.294}).async_step_init()
 
         self.assertEqual(result["type"], "form")
-        (key, value), = result["data_schema"].items()
-        self.assertEqual(
-            key, ("optional", const.CONF_ENERGY_PRICE, (("suggested_value", 0.294),))
-        )
-        self.assertEqual(value[1]["unit_of_measurement"], "EUR/kWh")
+        schema = dict(result["data_schema"])
+        price = schema[("optional", const.CONF_ENERGY_PRICE, (("suggested_value", 0.294),))]
+        self.assertEqual(price[1]["unit_of_measurement"], "EUR/kWh")
+        interval = schema[("optional", const.CONF_UPDATE_INTERVAL_DAYS, (("suggested_value", 30),))]
+        self.assertEqual(interval[1]["min"], 1)
+
+    async def test_interval_is_stored_in_whole_days(self) -> None:
+        result = await self._flow({}).async_step_init({const.CONF_UPDATE_INTERVAL_DAYS: 14.0})
+
+        self.assertEqual(result["data"], {const.CONF_UPDATE_INTERVAL_DAYS: 14})
+        self.assertIsInstance(result["data"][const.CONF_UPDATE_INTERVAL_DAYS], int)
 
     async def test_saving_stores_the_price(self) -> None:
         result = await self._flow({}).async_step_init({const.CONF_ENERGY_PRICE: 0.294})

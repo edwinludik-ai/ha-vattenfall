@@ -38,6 +38,7 @@ from .const import (
     CONF_PASSWORD,
     CONF_SUBSCRIPTION_KEY,
     CONF_TEMPERATURE_AREA_CODE,
+    CONF_UPDATE_INTERVAL_DAYS,
     DEFAULT_NAME,
     DEFAULT_TEMPERATURE_AREA_CODE,
     DOMAIN,
@@ -473,17 +474,23 @@ class VattenfallConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 
 class VattenfallOptionsFlow(config_entries.OptionsFlow):
-    """Set the electricity price used for the meter reading cost statistic."""
+    """Set the electricity price and the download interval of Online Service entries."""
 
     def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
         """Keep the entry; self.config_entry is set by Home Assistant only from 2024.11."""
         self._entry = config_entry
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> FlowResult:
-        """Ask for the price per kWh; leaving it empty removes it."""
+        """Ask for the price per kWh (empty removes it) and the days between downloads."""
         if user_input is not None:
-            return self.async_create_entry(title="", data=dict(user_input))
+            options = dict(user_input)
+            if options.get(CONF_UPDATE_INTERVAL_DAYS) is not None:
+                options[CONF_UPDATE_INTERVAL_DAYS] = int(options[CONF_UPDATE_INTERVAL_DAYS])
+            return self.async_create_entry(title="", data=options)
 
+        interval = self._entry.options.get(
+            CONF_UPDATE_INTERVAL_DAYS, VattenfallDeClient.default_download_interval.days
+        )
         currency = self.hass.config.currency
         schema = vol.Schema(
             {
@@ -494,9 +501,21 @@ class VattenfallOptionsFlow(config_entries.OptionsFlow):
                     NumberSelectorConfig(
                         min=0,
                         max=10,
-                        step=0.0001,
+                        step="any",
                         mode=NumberSelectorMode.BOX,
                         unit_of_measurement=f"{currency}/kWh",
+                    )
+                ),
+                vol.Optional(
+                    CONF_UPDATE_INTERVAL_DAYS,
+                    description={"suggested_value": interval},
+                ): NumberSelector(
+                    NumberSelectorConfig(
+                        min=1,
+                        max=365,
+                        step=1,
+                        mode=NumberSelectorMode.BOX,
+                        unit_of_measurement="d",
                     )
                 ),
             }

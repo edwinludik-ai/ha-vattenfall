@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
-from datetime import date
+from datetime import date, timedelta
 import logging
 import re
 from typing import Any
@@ -81,6 +81,8 @@ class VattenfallDeClient(VattenfallApiClient):
     supports_contract = False
     supports_meter_readings = True
     api_timezone = zoneinfo.ZoneInfo("Europe/Berlin")
+    # Readings are entered about once a month, so download monthly unless set otherwise.
+    default_download_interval = timedelta(days=30)
 
     def __init__(self, hass: HomeAssistant, config: Mapping[str, Any]) -> None:
         super().__init__(

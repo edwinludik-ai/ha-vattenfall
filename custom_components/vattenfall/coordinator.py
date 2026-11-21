@@ -31,7 +31,9 @@ from .const import (
     ATTR_HOURLY_END_DATE,
     ATTR_HOURLY_POINTS,
     ATTR_HOURLY_START_DATE,
+    ATTR_LAST_DOWNLOAD,
     ATTR_METER_READING_POINTS,
+    ATTR_NEXT_DOWNLOAD,
     ATTR_POINTS,
     ATTR_QUARTER_HOUR_POINTS,
     ATTR_START_DATE,
@@ -42,6 +44,7 @@ from .const import (
     CONF_ENERGY_PRICE,
     CONF_METERING_POINT_ID,
     CONF_TEMPERATURE_AREA_CODE,
+    CONF_UPDATE_INTERVAL_DAYS,
     DEFAULT_SCAN_INTERVAL,
     DEFAULT_TEMPERATURE_AREA_CODE,
     DOMAIN,
@@ -271,23 +274,34 @@ class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Local copy of the reading history, merged with every fetch (created on first use).
         self._meter_reading_store: Any = None
         self._stored_meter_readings: list[MeterReading] | None = None
+        # Scheduled downloads (Online Service): when data was last downloaded, kept in the
+        # store so a restart does not download again, and whether to download regardless.
+        self._last_download: datetime | None = None
+        self._force_download = False
+
+    @property
+    def download_interval(self) -> timedelta | None:
+        """Return the time between downloads, or None when every update downloads."""
+        default = getattr(self.client, "default_download_interval", None)
+        if default is None:
+            return None
+        days = (getattr(self.entry, "options", None) or {}).get(CONF_UPDATE_INTERVAL_DAYS)
+        return timedelta(days=int(days)) if days else default
+
+    async def async_download_now(self) -> bool:
+        """Download from Vattenfall now, whatever the interval; return whether it worked."""
+        before = self._last_download
+        self._force_download = True
+        await self.async_refresh()
+        return self._last_download is not None and self._last_download != before
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch latest data from API."""
         try:
-            end_date = date.today() - timedelta(days=1)
-            month_start = end_date.replace(day=1)
-            hourly_end = date.today()
-            # Vattenfall publishes about once a day, so yesterday may still be missing.
-            hourly_start = hourly_end - timedelta(days=2)
-            data = await self._async_build_data(
-                daily_start=month_start,
-                daily_end=end_date,
-                hourly_start=hourly_start,
-                hourly_end=hourly_end,
-                temperature_start=hourly_start,
-                temperature_end=hourly_end,
-            )
+            if self.download_interval is not None:
+                data = await self._async_scheduled_data()
+            else:
+                data = await self._async_download()
         except VattenfallAccessDeniedError as err:
             raise ConfigEntryAuthFailed(f"Vattenfall rejected the login: {err}") from err
         except VattenfallApiError as err:
@@ -316,6 +330,84 @@ class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         ATTR_FIXED_FEE_INCL_VAT_INCL_DISCOUNT: None,
                     }
                 )
+        return data
+
+    async def _async_download(self) -> dict[str, Any]:
+        """Download the current data groups from Vattenfall."""
+        end_date = date.today() - timedelta(days=1)
+        month_start = end_date.replace(day=1)
+        hourly_end = date.today()
+        # Vattenfall publishes about once a day, so yesterday may still be missing.
+        hourly_start = hourly_end - timedelta(days=2)
+        return await self._async_build_data(
+            daily_start=month_start,
+            daily_end=end_date,
+            hourly_start=hourly_start,
+            hourly_end=hourly_end,
+            temperature_start=hourly_start,
+            temperature_end=hourly_end,
+        )
+
+    async def _async_scheduled_data(self) -> dict[str, Any]:
+        """Download once per interval (or on request) and use stored data in between.
+
+        Between downloads, the meter reading values are recalculated from the stored
+        readings, so values that depend on today's date stay current. A failed download
+        falls back to the stored readings and is retried at the next update.
+        """
+        await self._async_load_meter_store()
+        interval = self.download_interval
+        assert interval is not None
+        stored = self._stored_meter_readings or []
+        now = datetime.now(timezone.utc)
+        due = (
+            self._force_download
+            or self._last_download is None
+            or now >= self._last_download + interval
+        )
+        self._force_download = False
+
+        if due:
+            try:
+                data = await self._async_download()
+            except VattenfallAccessDeniedError:
+                raise
+            except VattenfallApiError as err:
+                if not stored:
+                    raise
+                _LOGGER.warning(
+                    "Could not download Vattenfall data, using the stored meter readings "
+                    "until the next attempt: %s",
+                    err,
+                )
+                data = self._stored_data()
+            else:
+                if "meter_reading" not in data[ATTR_FAILED_GROUPS]:
+                    self._last_download = now
+                    await self._async_save_meter_store()
+                elif stored:
+                    data.update(self._meter_reading_data(stored))
+                    data[ATTR_FAILED_GROUPS] = data[ATTR_FAILED_GROUPS] - {"meter_reading"}
+        elif self.data is not None:
+            data = {**self.data, **self._meter_reading_data(stored)}
+        else:
+            data = self._stored_data()
+
+        data[ATTR_LAST_DOWNLOAD] = self._last_download
+        data[ATTR_NEXT_DOWNLOAD] = (
+            self._last_download + interval if self._last_download is not None else now
+        )
+        return data
+
+    def _stored_data(self) -> dict[str, Any]:
+        """Build coordinator data from the stored meter readings only."""
+        stored = self._stored_meter_readings or []
+        data = self._meter_reading_data(stored)
+        # Consumption time series are not stored; they wait for the next download.
+        failed = {"daily", "hourly"}
+        if not stored:
+            failed.add("meter_reading")
+        data[ATTR_FAILED_GROUPS] = failed
         return data
 
     async def _async_fetch_contract_data(self) -> dict[str, Any]:
@@ -433,7 +525,8 @@ class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     _LOGGER.info("Vattenfall %s data is available again", group)
 
         if errors and len(errors) == len(builders):
-            raise next(iter(errors.values()))
+            # Meter readings are the main data where they exist, so report their error.
+            raise errors.get("meter_reading") or next(iter(errors.values()))
 
         data[ATTR_FAILED_GROUPS] = set(errors)
         return data
@@ -564,6 +657,10 @@ class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Build the meter reading (Zählerstand) part of the coordinator data."""
         fetched = await self.client.async_get_meter_readings()
         readings = await self._async_merge_stored_meter_readings(fetched)
+        return self._meter_reading_data(readings)
+
+    def _meter_reading_data(self, readings: list[MeterReading]) -> dict[str, Any]:
+        """Return the meter reading values for a reading history."""
         latest = max(readings, key=_reading_day) if readings else None
         return {
             "latest_meter_reading_value": latest.value if latest else None,
@@ -588,6 +685,18 @@ class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self, fetched: list[MeterReading]
     ) -> list[MeterReading]:
         """Merge fetched readings into the local store and return the full history."""
+        await self._async_load_meter_store()
+        stored = self._stored_meter_readings or []
+        merged = _merge_meter_readings(stored, fetched)
+        if merged != stored:
+            self._stored_meter_readings = merged
+            await self._async_save_meter_store()
+        return merged
+
+    async def _async_load_meter_store(self) -> None:
+        """Load the stored reading history and last download time once."""
+        if self._stored_meter_readings is not None:
+            return
         if self._meter_reading_store is None:
             from homeassistant.helpers.storage import Store  # noqa: PLC0415
 
@@ -596,26 +705,30 @@ class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 _METER_READING_STORE_VERSION,
                 f"{DOMAIN}.meter_readings.{self.entry.entry_id}",
             )
-        if self._stored_meter_readings is None:
-            stored = await self._meter_reading_store.async_load() or {}
-            self._stored_meter_readings = []
-            for item in stored.get("readings") or []:
-                try:
-                    self._stored_meter_readings.append(
-                        MeterReading(
-                            **{k: v for k, v in item.items() if k in _METER_READING_FIELDS}
-                        )
-                    )
-                except TypeError:
-                    continue
+        stored = await self._meter_reading_store.async_load() or {}
+        readings: list[MeterReading] = []
+        for item in stored.get("readings") or []:
+            try:
+                readings.append(
+                    MeterReading(**{k: v for k, v in item.items() if k in _METER_READING_FIELDS})
+                )
+            except TypeError:
+                continue
+        self._stored_meter_readings = readings
+        try:
+            last = stored.get("last_download")
+            self._last_download = datetime.fromisoformat(last) if last else None
+        except (TypeError, ValueError):
+            self._last_download = None
 
-        merged = _merge_meter_readings(self._stored_meter_readings, fetched)
-        if merged != self._stored_meter_readings:
-            await self._meter_reading_store.async_save(
-                {"readings": [asdict(reading) for reading in merged]}
-            )
-            self._stored_meter_readings = merged
-        return merged
+    async def _async_save_meter_store(self) -> None:
+        """Save the reading history and last download time."""
+        await self._meter_reading_store.async_save(
+            {
+                "readings": [asdict(reading) for reading in self._stored_meter_readings or []],
+                "last_download": self._last_download.isoformat() if self._last_download else None,
+            }
+        )
 
     async def _async_write_statistics(
         self,

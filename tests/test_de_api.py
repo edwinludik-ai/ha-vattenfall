@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 import importlib
+from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from zoneinfo import ZoneInfo
 
 from test_api_flow import FakeHttpxClient, FakeResponse, api
@@ -13,6 +14,7 @@ from test_api_flow import FakeHttpxClient, FakeResponse, api
 de_api = importlib.import_module("custom_components.vattenfall.de_api")
 const = importlib.import_module("custom_components.vattenfall.const")
 coordinator_mod = importlib.import_module("custom_components.vattenfall.coordinator")
+ConfigEntryAuthFailed = importlib.import_module("homeassistant.exceptions").ConfigEntryAuthFailed
 
 BASE = const.ONLINE_DE_API_BASE_URL
 LOGIN_URL = f"{BASE}Account/GetTokenAllgemein"
@@ -532,6 +534,132 @@ class TestDeMeterReadingStore(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first, second)
         self.assertEqual(store.saves, 1)
         self.assertEqual(len(store.data["readings"]), 3)
+
+
+class _ScheduledDeClient(_DeFakeClient):
+    """Online Service client without a Lastgang, counting meter reading downloads."""
+
+    default_download_interval = de_api.VattenfallDeClient.default_download_interval
+
+    def __init__(self) -> None:
+        self.downloads = 0
+        self.fail: Exception | None = None
+
+    async def async_get_daily_consumption(self, start, end, allow_stub=True):
+        raise api.VattenfallApiError("no Lastgang")
+
+    async def async_get_hourly_consumption(self, start, end, include_load=True, allow_stub=True):
+        raise api.VattenfallApiError("no Lastgang")
+
+    async def async_get_contract(self, allow_stub=True):
+        return api.ContractTariff(None, None, None)
+
+    async def async_get_meter_readings(self, allow_stub=True):
+        self.downloads += 1
+        if self.fail is not None:
+            raise self.fail
+        return await super().async_get_meter_readings(allow_stub)
+
+
+class TestDeScheduledDownloads(unittest.IsolatedAsyncioTestCase):
+    """Online Service data is downloaded once per interval and on request."""
+
+    def _coordinator(self, store: _FakeStore, options: dict | None = None):
+        client = _ScheduledDeClient()
+        entry = SimpleNamespace(
+            entry_id="entry-1", data={"metering_point_id": VK}, options=options or {}
+        )
+        coordinator = coordinator_mod.VattenfallDataUpdateCoordinator(
+            hass=SimpleNamespace(), client=client, entry=entry
+        )
+        coordinator._meter_reading_store = store
+        coordinator._async_write_meter_reading_statistics = AsyncMock()
+        return coordinator, client
+
+    def test_online_service_defaults_to_a_monthly_download(self) -> None:
+        self.assertEqual(de_api.VattenfallDeClient.default_download_interval, timedelta(days=30))
+        self.assertIsNone(api.VattenfallApiClient.default_download_interval)
+
+    async def test_first_update_downloads_and_later_updates_reuse_the_data(self) -> None:
+        store = _FakeStore()
+        coordinator, client = self._coordinator(store)
+
+        first = await coordinator._async_update_data()
+        coordinator.data = first
+        second = await coordinator._async_update_data()
+
+        self.assertEqual(client.downloads, 1)
+        self.assertEqual(second["latest_meter_reading_value"], 12345.6)
+        self.assertIsNotNone(store.data["last_download"])
+        last = datetime.fromisoformat(store.data["last_download"])
+        self.assertEqual(second[const.ATTR_LAST_DOWNLOAD], last)
+        self.assertEqual(second[const.ATTR_NEXT_DOWNLOAD], last + timedelta(days=30))
+
+    async def test_restart_within_the_interval_uses_stored_readings(self) -> None:
+        recent = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+        stored = [de_api_asdict(r) for r in await _DeFakeClient().async_get_meter_readings()]
+        coordinator, client = self._coordinator(
+            _FakeStore({"readings": stored, "last_download": recent})
+        )
+
+        data = await coordinator._async_update_data()
+
+        self.assertEqual(client.downloads, 0)
+        self.assertEqual(data["latest_meter_reading_value"], 12345.6)
+        # Groups that are not stored stay unavailable until the next download.
+        self.assertEqual(data[const.ATTR_FAILED_GROUPS], {"daily", "hourly"})
+
+    async def test_download_is_due_after_the_configured_interval(self) -> None:
+        old = (datetime.now(timezone.utc) - timedelta(days=8)).isoformat()
+        coordinator, client = self._coordinator(
+            _FakeStore({"readings": [], "last_download": old}),
+            options={const.CONF_UPDATE_INTERVAL_DAYS: 7},
+        )
+
+        data = await coordinator._async_update_data()
+
+        self.assertEqual(client.downloads, 1)
+        self.assertEqual(
+            data[const.ATTR_NEXT_DOWNLOAD] - data[const.ATTR_LAST_DOWNLOAD], timedelta(days=7)
+        )
+
+    async def test_manual_download_ignores_the_interval(self) -> None:
+        recent = datetime.now(timezone.utc).isoformat()
+        coordinator, client = self._coordinator(_FakeStore({"readings": [], "last_download": recent}))
+        coordinator.async_refresh = AsyncMock(side_effect=coordinator._async_update_data)
+
+        self.assertTrue(await coordinator.async_download_now())
+        await coordinator._async_update_data()
+
+        self.assertEqual(client.downloads, 1)
+        client.fail = api.VattenfallApiError("down")
+        coordinator.async_refresh = AsyncMock()
+        self.assertFalse(await coordinator.async_download_now())
+
+    async def test_failed_download_keeps_stored_readings_and_retries(self) -> None:
+        old = (datetime.now(timezone.utc) - timedelta(days=40)).isoformat()
+        stored = [de_api_asdict(r) for r in await _DeFakeClient().async_get_meter_readings()]
+        store = _FakeStore({"readings": stored, "last_download": old})
+        coordinator, client = self._coordinator(store)
+        client.fail = api.VattenfallApiError("down")
+
+        data = await coordinator._async_update_data()
+        client.fail = None
+        coordinator.data = data
+        await coordinator._async_update_data()
+
+        self.assertEqual(data["latest_meter_reading_value"], 12345.6)
+        self.assertNotIn("meter_reading", data[const.ATTR_FAILED_GROUPS])
+        self.assertEqual(data[const.ATTR_LAST_DOWNLOAD], datetime.fromisoformat(old))
+        self.assertEqual(client.downloads, 2)
+        self.assertNotEqual(store.data["last_download"], old)
+
+    async def test_refused_login_still_starts_reauthentication(self) -> None:
+        coordinator, client = self._coordinator(_FakeStore())
+        client.fail = api.VattenfallAccessDeniedError("refused")
+
+        with self.assertRaises(ConfigEntryAuthFailed):
+            await coordinator._async_update_data()
 
 
 def de_api_asdict(reading) -> dict:
