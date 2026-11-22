@@ -23,6 +23,7 @@ from .api import (
     VattenfallAccessDeniedError,
     VattenfallApiClient,
     VattenfallApiError,
+    VattenfallNoLoadProfileError,
 )
 from .const import (
     ATTR_END_DATE,
@@ -379,6 +380,9 @@ class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     # Timezone the client's API reports local timestamps in (set per client in __init__).
     _tz: zoneinfo.ZoneInfo = _API_TIMEZONE
+    # Whether the contract has a consumption time series (daily and hourly data); None
+    # until a download finds out. Contracts without a smart meter only have readings.
+    _has_load_profile: bool | None = None
 
     def __init__(
         self,
@@ -417,6 +421,11 @@ class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return None
         day = (getattr(self.entry, "options", None) or {}).get(CONF_DOWNLOAD_DAY)
         return int(day) if day else default
+
+    @property
+    def has_load_profile(self) -> bool | None:
+        """Return whether the contract has daily and hourly data, or None if not known."""
+        return self._has_load_profile
 
     @staticmethod
     def _now() -> datetime:
@@ -512,6 +521,8 @@ class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._force_download
             or self._last_download is None
             or self._last_download < latest_scheduled
+            # Once at startup, find out whether there is a load profile (older stores).
+            or (self._has_load_profile is None and self.data is None)
         )
         self._force_download = False
 
@@ -666,6 +677,9 @@ class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 data.update(await build())
             except VattenfallAccessDeniedError:
                 raise
+            except VattenfallNoLoadProfileError as err:
+                errors[group] = err
+                _LOGGER.debug("No Vattenfall %s data: %s", group, err)
             except VattenfallApiError as err:
                 errors[group] = err
                 if group not in previously_failed:
@@ -674,12 +688,45 @@ class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 if group in previously_failed:
                     _LOGGER.info("Vattenfall %s data is available again", group)
 
+        self._update_load_profile(
+            [group for group in ("daily", "hourly") if group in builders], errors
+        )
+
         if errors and len(errors) == len(builders):
             # Meter readings are the main data where they exist, so report their error.
             raise errors.get("meter_reading") or next(iter(errors.values()))
 
         data[ATTR_FAILED_GROUPS] = set(errors)
         return data
+
+    def _update_load_profile(
+        self, groups: list[str], errors: dict[str, VattenfallApiError]
+    ) -> None:
+        """Remember whether the contract has a load profile from the daily and hourly fetch.
+
+        Data in any of the groups means it has one; only "no load profile" errors mean it
+        has none; other errors leave it as it was. When this changes after setup, the entry
+        is reloaded so the daily and hourly sensors are added or removed.
+        """
+        if any(group not in errors for group in groups):
+            has_load_profile = True
+        elif groups and all(
+            isinstance(errors[group], VattenfallNoLoadProfileError) for group in groups
+        ):
+            has_load_profile = False
+        else:
+            return
+
+        # Sensors are created unless the contract is known to have no load profile.
+        sensors_before = self._has_load_profile is not False
+        self._has_load_profile = has_load_profile
+        if has_load_profile is False and sensors_before:
+            _LOGGER.info(
+                "This Vattenfall contract has no consumption time series (no smart meter), "
+                "so the daily and hourly sensors are not created"
+            )
+        if self.data is not None and sensors_before != has_load_profile:
+            self.hass.config_entries.async_schedule_reload(self.entry.entry_id)
 
     async def _async_build_daily(self, daily_start: date, daily_end: date) -> dict[str, Any]:
         """Build the daily consumption part of the coordinator data."""
@@ -844,7 +891,7 @@ class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return merged
 
     async def _async_load_meter_store(self) -> None:
-        """Load the stored reading history and last download time once."""
+        """Load the stored reading history, last download time and load profile flag once."""
         if self._stored_meter_readings is not None:
             return
         if self._meter_reading_store is None:
@@ -870,13 +917,17 @@ class VattenfallDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._last_download = datetime.fromisoformat(last) if last else None
         except (TypeError, ValueError):
             self._last_download = None
+        has_load_profile = stored.get("has_load_profile")
+        if self._has_load_profile is None and isinstance(has_load_profile, bool):
+            self._has_load_profile = has_load_profile
 
     async def _async_save_meter_store(self) -> None:
-        """Save the reading history and last download time."""
+        """Save the reading history, last download time and load profile flag."""
         await self._meter_reading_store.async_save(
             {
                 "readings": [asdict(reading) for reading in self._stored_meter_readings or []],
                 "last_download": self._last_download.isoformat() if self._last_download else None,
+                "has_load_profile": self._has_load_profile,
             }
         )
 

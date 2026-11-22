@@ -36,6 +36,7 @@ from .api import (
     VattenfallApiClient,
     VattenfallApiError,
     VattenfallAuthError,
+    VattenfallNoLoadProfileError,
 )
 from .const import (
     CONF_METERING_POINT_ID,
@@ -371,7 +372,7 @@ class VattenfallDeClient(VattenfallApiClient):
                 daily.append(ConsumptionPoint(date=stamp[:10], value_kwh=numeric))
 
         if not daily and not hourly:
-            raise VattenfallApiError(
+            raise VattenfallNoLoadProfileError(
                 f"Vattenfall has no consumption time series (Lastgang) for this contract "
                 f"from {start_date.isoformat()} to {end_date.isoformat()}; contracts without "
                 "a smart meter only have meter readings"

@@ -15,6 +15,7 @@ from homeassistant.components.sensor import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EntityCategory, UnitOfEnergy, UnitOfTemperature
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
@@ -40,6 +41,11 @@ from .const import (
 )
 from .coordinator import VattenfallDataUpdateCoordinator
 from .entity import vattenfall_device_info
+
+
+# Groups that need the consumption time series (load profile), which contracts without
+# a smart meter do not have.
+_LOAD_PROFILE_GROUPS = frozenset({"daily", "hourly"})
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -356,12 +362,16 @@ async def async_setup_entry(
         "coordinator"
     ]
 
-    entities = [
-        VattenfallSensor(coordinator=coordinator, entry=entry, description=description)
+    descriptions = [
+        description
         for description in SENSORS
         if (
             description.attribute_group != "quarter_hour"
             or getattr(coordinator.client, "supports_quarter_hour", False)
+        )
+        and (
+            description.attribute_group not in _LOAD_PROFILE_GROUPS
+            or coordinator.has_load_profile is not False
         )
         and (
             description.attribute_group != "contract"
@@ -380,7 +390,24 @@ async def async_setup_entry(
             or coordinator.download_day is not None
         )
     ]
-    async_add_entities(entities)
+
+    # Remove sensors this entry no longer provides, so they do not stay unavailable.
+    registry = er.async_get(hass)
+    for description in SENSORS:
+        if description in descriptions:
+            continue
+        entity_id = registry.async_get_entity_id(
+            "sensor", DOMAIN, f"{entry.entry_id}_{description.key}"
+        )
+        if entity_id is not None:
+            registry.async_remove(entity_id)
+
+    async_add_entities(
+        [
+            VattenfallSensor(coordinator=coordinator, entry=entry, description=description)
+            for description in descriptions
+        ]
+    )
 
 
 class VattenfallSensor(CoordinatorEntity[VattenfallDataUpdateCoordinator], SensorEntity):

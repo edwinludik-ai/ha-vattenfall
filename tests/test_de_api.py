@@ -6,7 +6,7 @@ from datetime import date, datetime, timedelta, timezone
 import importlib
 from types import SimpleNamespace
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 from zoneinfo import ZoneInfo
 
 from test_api_flow import FakeHttpxClient, FakeResponse, api
@@ -393,7 +393,7 @@ class TestVattenfallDeApi(unittest.IsolatedAsyncioTestCase):
         session = FakeHttpxClient(routes)
         with patch.object(api.httpx, "AsyncClient", return_value=session):
             client = de_api.VattenfallDeClient(hass=object(), config=_config())
-            with self.assertRaises(api.VattenfallApiError) as ctx:
+            with self.assertRaises(api.VattenfallNoLoadProfileError) as ctx:
                 await client.async_get_daily_consumption(date(2026, 11, 1), date(2026, 11, 20))
 
         message = str(ctx.exception)
@@ -548,10 +548,10 @@ class _ScheduledDeClient(_DeFakeClient):
         self.fail: Exception | None = None
 
     async def async_get_daily_consumption(self, start, end, allow_stub=True):
-        raise api.VattenfallApiError("no Lastgang")
+        raise api.VattenfallNoLoadProfileError("no Lastgang")
 
     async def async_get_hourly_consumption(self, start, end, include_load=True, allow_stub=True):
-        raise api.VattenfallApiError("no Lastgang")
+        raise api.VattenfallNoLoadProfileError("no Lastgang")
 
     async def async_get_contract(self, allow_stub=True):
         return api.ContractTariff(None, None, None)
@@ -646,7 +646,13 @@ class TestDeScheduledDownloads(unittest.IsolatedAsyncioTestCase):
     async def test_restart_after_this_months_download_uses_stored_readings(self) -> None:
         downloaded = datetime(2026, 11, 2, 0, 30, tzinfo=_BERLIN).isoformat()
         coordinator, client = self._coordinator(
-            _FakeStore({"readings": await self._stored_readings(), "last_download": downloaded})
+            _FakeStore(
+                {
+                    "readings": await self._stored_readings(),
+                    "last_download": downloaded,
+                    "has_load_profile": False,
+                }
+            )
         )
 
         data = await coordinator._async_update_data()
@@ -671,7 +677,7 @@ class TestDeScheduledDownloads(unittest.IsolatedAsyncioTestCase):
     async def test_download_waits_for_the_download_day(self) -> None:
         downloaded = datetime(2026, 11, 2, 0, 30, tzinfo=_BERLIN).isoformat()
         coordinator, client = self._coordinator(
-            _FakeStore({"readings": [], "last_download": downloaded}),
+            _FakeStore({"readings": [], "last_download": downloaded, "has_load_profile": False}),
             options={const.CONF_DOWNLOAD_DAY: 25},
         )
 
@@ -719,6 +725,109 @@ class TestDeScheduledDownloads(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(ConfigEntryAuthFailed):
             await coordinator._async_update_data()
+
+
+class _LoadProfileDeClient(_ScheduledDeClient):
+    """Online Service client whose contract has a load profile (smart meter)."""
+
+    async def async_get_daily_consumption(self, start, end, allow_stub=True):
+        return [api.ConsumptionPoint(date="2026-11-20", value_kwh=5.0)]
+
+    async def async_get_hourly_consumption(self, start, end, include_load=True, allow_stub=True):
+        return [api.HourlyConsumptionPoint(date_time="2026-11-20T10:00:00", value_kwh=0.3)]
+
+
+class TestDeLoadProfile(unittest.IsolatedAsyncioTestCase):
+    """Contracts without a smart meter have no load profile, so its sensors are hidden."""
+
+    def _coordinator(self, store: _FakeStore, client: _ScheduledDeClient | None = None):
+        client = client or _ScheduledDeClient()
+        entry = SimpleNamespace(entry_id="entry-1", data={"metering_point_id": VK}, options={})
+        coordinator = coordinator_mod.VattenfallDataUpdateCoordinator(
+            hass=SimpleNamespace(), client=client, entry=entry
+        )
+        coordinator.hass = SimpleNamespace(
+            config_entries=SimpleNamespace(async_schedule_reload=Mock())
+        )
+        coordinator._meter_reading_store = store
+        coordinator._async_write_meter_reading_statistics = AsyncMock()
+        coordinator._now = lambda: _NOW
+        return coordinator, client
+
+    async def test_contract_without_load_profile_is_remembered(self) -> None:
+        store = _FakeStore()
+        coordinator, _client = self._coordinator(store)
+
+        data = await coordinator._async_update_data()
+
+        self.assertIs(coordinator.has_load_profile, False)
+        self.assertIs(store.data["has_load_profile"], False)
+        # Still reported as failed groups, which no sensor uses any more.
+        self.assertEqual(data[const.ATTR_FAILED_GROUPS], {"daily", "hourly"})
+        # The first refresh decides which sensors are created, so no reload.
+        coordinator.hass.config_entries.async_schedule_reload.assert_not_called()
+
+    async def test_contract_with_load_profile_is_remembered(self) -> None:
+        store = _FakeStore()
+        coordinator, _client = self._coordinator(store, _LoadProfileDeClient())
+
+        data = await coordinator._async_update_data()
+
+        self.assertIs(coordinator.has_load_profile, True)
+        self.assertIs(store.data["has_load_profile"], True)
+        self.assertEqual(data[const.ATTR_FAILED_GROUPS], set())
+
+    async def test_store_without_the_flag_downloads_once_after_restart(self) -> None:
+        downloaded = datetime(2026, 11, 2, 0, 30, tzinfo=_BERLIN).isoformat()
+        store = _FakeStore({"readings": await _stored_readings(), "last_download": downloaded})
+        coordinator, client = self._coordinator(store)
+
+        coordinator.data = await coordinator._async_update_data()
+        await coordinator._async_update_data()
+
+        self.assertEqual(client.downloads, 1)
+        self.assertIs(store.data["has_load_profile"], False)
+
+    async def test_smart_meter_added_later_reloads_the_entry(self) -> None:
+        downloaded = datetime(2026, 10, 2, 0, 30, tzinfo=_BERLIN).isoformat()
+        store = _FakeStore(
+            {
+                "readings": await _stored_readings(),
+                "last_download": downloaded,
+                "has_load_profile": False,
+            }
+        )
+        coordinator, _client = self._coordinator(store, _LoadProfileDeClient())
+        coordinator.data = {const.ATTR_FAILED_GROUPS: {"daily", "hourly"}}
+
+        await coordinator._async_update_data()
+
+        self.assertIs(coordinator.has_load_profile, True)
+        coordinator.hass.config_entries.async_schedule_reload.assert_called_once_with("entry-1")
+
+    async def test_load_profile_lost_after_setup_reloads_the_entry(self) -> None:
+        store = _FakeStore({"readings": [], "last_download": None})
+        coordinator, _client = self._coordinator(store)
+        # Set up before the flag was known, so the daily and hourly sensors exist.
+        coordinator.data = {const.ATTR_FAILED_GROUPS: set()}
+
+        await coordinator._async_update_data()
+
+        self.assertIs(coordinator.has_load_profile, False)
+        coordinator.hass.config_entries.async_schedule_reload.assert_called_once_with("entry-1")
+
+    async def test_unchanged_flag_does_not_reload(self) -> None:
+        store = _FakeStore({"readings": [], "last_download": None, "has_load_profile": False})
+        coordinator, _client = self._coordinator(store)
+        coordinator.data = {const.ATTR_FAILED_GROUPS: {"daily", "hourly"}}
+
+        await coordinator._async_update_data()
+
+        coordinator.hass.config_entries.async_schedule_reload.assert_not_called()
+
+
+async def _stored_readings() -> list[dict]:
+    return [de_api_asdict(r) for r in await _DeFakeClient().async_get_meter_readings()]
 
 
 def de_api_asdict(reading) -> dict:

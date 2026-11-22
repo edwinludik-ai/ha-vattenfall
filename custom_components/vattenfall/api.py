@@ -59,6 +59,10 @@ class VattenfallApiError(Exception):
     """Generic API error."""
 
 
+class VattenfallNoLoadProfileError(VattenfallApiError):
+    """The contract has no consumption time series, as without a smart meter."""
+
+
 class VattenfallAuthError(VattenfallApiError):
     """Authentication error."""
 

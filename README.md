@@ -165,8 +165,10 @@ even if the portal stops returning them. From it, the integration derives:
 #### Contracts with only meter readings
 
 Vattenfall only has a consumption time series for meters that send it themselves (smart meters). For other meters, the
-portal only knows the readings entered on the Zählerstand page, so the consumption sensors stay unavailable and the log
-says there is no `Lastgang` for the contract.
+portal only knows the readings entered on the Zählerstand page, so there is no `Lastgang` for the contract. The
+integration then does not create the daily and hourly consumption sensors (and removes them if an earlier version
+created them). It remembers this; if Vattenfall later has a consumption time series for the contract (a smart meter
+was installed), the entry reloads at that download and the sensors are added.
 
 For the Energy dashboard, the integration turns the readings into the statistic `Vattenfall Meter Reading Consumption`
 (`vattenfall:meter_reading_consumption_<contract>`): the consumption between two readings is spread evenly over the
@@ -181,7 +183,8 @@ real consumption and the forecast starts again from the new reading.
 The German portal only changes when a reading is entered, so Online Service entries download from Vattenfall once a
 month instead of every hour: on the download day (default the 2nd, the day after readings are usually entered), at the
 first hourly check after midnight (Europe/Berlin). Change the `Download day of the month` (1–31) in the entry's
-`Configure` dialog; months with fewer days use their last day. Setting up the entry downloads right away. The time of
+`Configure` dialog; months with fewer days use their last day. Setting up the entry downloads right away, as does the
+first start after upgrading from a version that did not yet store whether the contract has a `Lastgang`. The time of
 the last download is stored, so restarting Home Assistant does not download again before the next download day; in
 between, the sensors use the stored readings (and values that depend on today's date, such as the estimated current
 reading, keep moving). Consumption time series sensors, which smart meters have, are not stored and stay unavailable
